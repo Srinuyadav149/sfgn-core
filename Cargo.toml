@@ -9,6 +9,7 @@ description = "Zero-copy Simple Flat Graph Notation (SFGN v1.0) parser and progr
 members = [
   ".",
   "crates/sfgn-extract-fs",
+  "crates/sfgn-extract-code",
   "crates/sfgn-fs-tests",
 ]
 

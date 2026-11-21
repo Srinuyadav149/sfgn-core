@@ -1,4 +1,6 @@
-use sfgn_core::{Document, render_ascii_tree, render_mermaid};
+use sfgn_core::{
+    Document, MermaidDirection, render_ascii_tree, render_mermaid, render_mermaid_with_direction,
+};
 
 #[test]
 fn renders_ascii_tree_and_mermaid_for_dual_topology_graph() {
@@ -33,8 +35,12 @@ fn renders_ascii_tree_and_mermaid_for_dual_topology_graph() {
     assert!(ascii.contains(r###"──>> ["builder.rs"]"###));
     assert!(ascii.contains(r###"──>  <"external_spec.sfgn">"###));
 
-    let mermaid = render_mermaid(&doc);
-    assert!(mermaid.starts_with("graph TD\n"));
-    assert!(mermaid.contains("N0 --> N1"));
-    assert!(mermaid.contains("N2 -. \">>\" .-> N3"));
+    let mermaid_td = render_mermaid(&doc);
+    assert!(mermaid_td.starts_with("graph TD\n"));
+    assert!(mermaid_td.contains("N0 --> N1"));
+    assert!(mermaid_td.contains("N2 -. \">>\" .-> N3"));
+
+    let mermaid_lr = render_mermaid_with_direction(&doc, MermaidDirection::LeftRight);
+    assert!(mermaid_lr.starts_with("graph LR\n"));
+    assert!(mermaid_lr.contains("N0 --> N1"));
 }
