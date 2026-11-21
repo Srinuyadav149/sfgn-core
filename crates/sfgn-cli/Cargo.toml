@@ -1,0 +1,15 @@
+[package]
+name = "sfgn-cli"
+version = "0.1.0"
+edition = "2024"
+description = "Unified CLI for compiling, inspecting, slicing, searching, visualizing, and patching SFGN v1.0 graphs"
+
+[[bin]]
+name = "sfgn"
+path = "src/main.rs"
+
+[dependencies]
+sfgn-core = { path = "../.." }
+sfgn-extract-fs = { path = "../sfgn-extract-fs" }
+sfgn-extract-code = { path = "../sfgn-extract-code" }
+sfgn-extract-docs = { path = "../sfgn-extract-docs" }

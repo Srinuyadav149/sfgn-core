@@ -4,7 +4,7 @@ Simple Flat Graph Notation (`SFGN v1.0`) is a zero-copy, dual-topology graph ser
 
 ## Workspace Architecture
 
-The workspace separates the zero-copy core tape engine from domain-specific graph compilers. See [Extractor Crates](#extractor-crates) for domain compilers and [SFGN Grammar](#sfgn-grammar) for the formal syntax.
+The workspace separates the zero-copy core tape engine from domain-specific graph compilers and the unified CLI. See [Extractor Crates](#extractor-crates) for domain compilers and [SFGN Grammar](#sfgn-grammar) for the formal syntax.
 
 | Crate | Role | Output Artifact |
 | :--- | :--- | :--- |
@@ -12,6 +12,7 @@ The workspace separates the zero-copy core tape engine from domain-specific grap
 | `sfgn-extract-fs` | `.gitignore`-aware filesystem & `gix` commit/co-change compiler | `fs.sfgn` |
 | `sfgn-extract-code` | Feature-gated `tree-sitter` AST compiler & disk line-span patcher | `code.sfgn` |
 | `sfgn-extract-docs` | CommonMark/GFM outline/table compiler, media proxy & GBNF transpiler | `doc.sfgn` / `.gbnf` |
+| `sfgn-cli` | Unified `sfgn` binary for compiling, slicing, searching, visualizing & patching | `.sfgn/` workspace bundle |
 
 ### Core Pipeline
 
@@ -41,6 +42,10 @@ Implemented in [sfgn-extract-code](crates/sfgn-extract-code/src/lib.rs) with `de
 
 Implemented in [sfgn-extract-docs](crates/sfgn-extract-docs/src/lib.rs), compiling Markdown headings into `>` containment trees, tables into `"""csv` payloads, binary media headers into `media_proxy` nodes, and EBNF rules into `llama.cpp` GBNF via [gbnf.rs](crates/sfgn-extract-docs/src/gbnf.rs).
 
+### Unified Workspace CLI
+
+Implemented in [sfgn-cli](crates/sfgn-cli/src/main.rs), exposing `sfgn compile`, `sfgn check`, `sfgn slice --follow-portals`, `sfgn grep`, `sfgn viz`, `sfgn patch`, and `sfgn gbnf` as stateless CLI subcommands over the workspace crates.
+
 ## SFGN Grammar
 
 ```ebnf
@@ -50,4 +55,3 @@ NodeBlock    = NodePath, ":", EOL, { IndentedItem } ;
 NodePath     = Segment, { ">", Segment } ;
 Segment      = QuotedString, [ "#", Digit, { Digit } ] ;
 ```
-

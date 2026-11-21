@@ -11,7 +11,7 @@ members = [
   "crates/sfgn-extract-fs",
   "crates/sfgn-extract-code",
   "crates/sfgn-extract-docs",
-  "crates/sfgn-fs-tests",
+  "crates/sfgn-cli",
 ]
 
 [dependencies]
