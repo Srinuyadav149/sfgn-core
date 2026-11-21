@@ -19,6 +19,7 @@ pub struct TempWorkspace {
     root: PathBuf,
 }
 
+#[allow(dead_code)]
 impl TempWorkspace {
     pub fn new(prefix: &str) -> io::Result<Self> {
         let nanos = SystemTime::now()

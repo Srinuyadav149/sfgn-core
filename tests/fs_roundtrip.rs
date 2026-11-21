@@ -1,11 +1,13 @@
 use std::borrow::Cow;
+mod common;
+
+use common::{FsPortalResolver, TempWorkspace, assert_documents_semantically_equal};
 
 use sfgn_core::{
     Document, ErrorCode, GraphBuilder, IndentStyle, NodeBuilder, OrphanPolicy, OwnedScalar,
     OwnedTarget, OwnedValue, ParseOptions, Scalar, Value, serialize_document,
     serialize_document_with_indent,
 };
-use sfgn_fs_tests::{FsPortalResolver, TempWorkspace, assert_documents_semantically_equal};
 
 #[test]
 fn programmatic_build_serialize_write_load_deserialize_loop() {
