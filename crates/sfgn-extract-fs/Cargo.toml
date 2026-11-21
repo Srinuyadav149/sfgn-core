@@ -1,0 +1,10 @@
+[package]
+name = "sfgn-extract-fs"
+version = "0.1.0"
+edition = "2024"
+description = "Filesystem and Git tree compiler emitting validated fs.sfgn graphs"
+
+[dependencies]
+sfgn-core = { path = "../.." }
+ignore = "0.4.34"
+gix = { version = "0.90.0", default-features = false, features = ["basic", "status", "revision", "sha1"] }

@@ -1,5 +1,5 @@
 [package]
-name = "sfgn_core"
+name = "sfgn-core"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.100"
@@ -8,6 +8,7 @@ description = "Zero-copy Simple Flat Graph Notation (SFGN v1.0) parser and progr
 [workspace]
 members = [
   ".",
+  "crates/sfgn-extract-fs",
   "crates/sfgn-fs-tests",
 ]
 

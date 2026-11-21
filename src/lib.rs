@@ -6,6 +6,7 @@ pub mod lexer;
 pub mod scanner;
 pub mod tape;
 pub mod topology;
+pub mod viz;
 
 pub use builder::{CompileError, EdgeTarget, NodeHandle, SfgnBuilder, SfgnScalar, SfgnValue};
 pub use document::{
@@ -26,6 +27,7 @@ pub use topology::{
     CanonicalNodePath, NodeSegmentKey, RelationTarget, TopologyIndex, build_topology,
     parse_canonical_node_path, unescape_quoted_string,
 };
+pub use viz::{render_ascii_tree, render_mermaid};
 
 /// Policy governing nodes declared at Depth 0 that are not reachable from `>:` via `>` child edges.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
