@@ -1,0 +1,10 @@
+[package]
+name = "sfgn-extract-docs"
+version = "0.1.0"
+edition = "2024"
+description = "Markdown outline/table compiler, binary media proxy scanner, and EBNF-to-GBNF grammar generator"
+
+[dependencies]
+sfgn-core = { path = "../.." }
+ignore = "0.4.34"
+pulldown-cmark = { version = "0.13.6", default-features = false }

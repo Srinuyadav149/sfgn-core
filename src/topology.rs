@@ -86,10 +86,35 @@ pub struct TopologyIndex {
 }
 
 impl TopologyIndex {
-    /// Resolves a canonical `NodePath` to its `NodeId` in O(1) average time.
+    /// Resolves a canonical `NodePath` to its `NodeId` in O(1) average time,
+    /// falling back to top-down `>` containment traversal for full ancestor paths.
     #[inline]
     pub fn lookup(&self, path: &CanonicalNodePath) -> Option<NodeId> {
-        self.path_to_id.get(path).copied()
+        if let Some(&id) = self.path_to_id.get(path) {
+            return Some(id);
+        }
+        self.lookup_by_containment_chain(path)
+    }
+
+    fn lookup_by_containment_chain(&self, path: &CanonicalNodePath) -> Option<NodeId> {
+        let segments = path.segments();
+        if segments.is_empty() {
+            return None;
+        }
+        let mut current = NodeId::ROOT;
+        for seg in segments {
+            let mut matched_child = None;
+            for &child_id in self.local_child_ids(current) {
+                if let Some(child_path) = self.canonical_path(child_id) {
+                    if child_path.segments().last() == Some(seg) {
+                        matched_child = Some(child_id);
+                        break;
+                    }
+                }
+            }
+            current = matched_child?;
+        }
+        Some(current)
     }
 
     /// Parses an SFGN `NodePath` string (e.g., `"StorageEngine" > "BufferPool"`) and looks up its `NodeId`.
