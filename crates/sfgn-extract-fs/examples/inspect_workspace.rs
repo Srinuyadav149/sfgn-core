@@ -19,7 +19,6 @@ fn main() {
         std::process::exit(1);
     });
 
-    // Save the generated file graph to `target/workspace_fs.sfgn` if `target/` exists
     let out_file = Path::new("target/workspace_fs.sfgn");
     if let Some(parent) = out_file.parent() {
         let _ = fs::create_dir_all(parent);
@@ -28,17 +27,24 @@ fn main() {
         println!("Saved generated SFGN document to: {}\n", out_file.display());
     }
 
+    let total_child_edges: usize = doc.nodes().map(|n| n.children().count()).sum();
+    let total_rel_edges: usize = doc.nodes().map(|n| n.relatives().count()).sum();
+    let total_portals: usize = doc.nodes().map(|n| n.external_portals().count()).sum();
+
     println!("============================================================");
     println!(
-        "1. GENERATED fs.sfgn DOCUMENT ({} nodes, {} bytes)",
+        "1. GENERATED fs.sfgn ({} nodes, {} > edges, {} >> co-change/symlink edges, {} lazy portals, {} bytes)",
         doc.len(),
+        total_child_edges,
+        total_rel_edges,
+        total_portals,
         sfgn_doc_text.len()
     );
     println!("============================================================");
     println!("{}", sfgn_doc_text);
 
     println!("============================================================");
-    println!("2. VISUAL DUAL-TOPOLOGY TREE (> containment, >> relatives)");
+    println!("2. VISUAL DUAL-TOPOLOGY TREE (> containment, >> relatives/portals)");
     println!("============================================================");
     println!("{}", render_ascii_tree(&doc));
 

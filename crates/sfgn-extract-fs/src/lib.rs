@@ -7,7 +7,10 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use ignore::WalkBuilder;
-use sfgn_core::{IndentStyle, NodeHandle, SfgnBuilder, SfgnValue};
+use sfgn_core::{
+    EdgeTarget, FlatArtifactDomain, IndentStyle, NodeHandle, SfgnBuilder, SfgnValue,
+    classify_workspace_file, flat_code_portal, flat_doc_portal, is_generated_sfgn_artifact,
+};
 
 pub use error::{FsExtractError, Result};
 use git::{GitMetadata, normalize_lexical_path, path_to_posix};
@@ -92,13 +95,24 @@ impl FsExtractor {
             self.options.max_co_changes_per_file,
         );
 
+        let filter_root = canon_root.clone();
         let mut walker = WalkBuilder::new(&canon_root);
         walker
             .hidden(false)
             .require_git(false)
             .follow_links(self.options.follow_symlinks)
             .max_depth(self.options.max_depth)
-            .filter_entry(|entry| entry.file_name() != ".git");
+            .filter_entry(move |entry| {
+                if entry.file_name() == ".git" {
+                    return false;
+                }
+                if let Ok(rel) = entry.path().strip_prefix(&filter_root) {
+                    if is_generated_sfgn_artifact(rel) {
+                        return false;
+                    }
+                }
+                true
+            });
 
         let mut entries_by_rel: BTreeMap<String, ScannedEntry> = BTreeMap::new();
 
@@ -112,6 +126,9 @@ impl FsExtractor {
             let Ok(rel_path) = path.strip_prefix(&canon_root) else {
                 continue;
             };
+            if is_generated_sfgn_artifact(rel_path) {
+                continue;
+            }
             let rel_posix = path_to_posix(rel_path);
             if rel_posix.is_empty() {
                 continue;
@@ -236,7 +253,7 @@ impl FsExtractor {
             }
         }
 
-        // Wire `>>` relative edges: symlinks and recent Git co-modifications.
+        // Wire `>>` relative edges: symlinks, recent Git co-modifications, and lazy flat portals.
         for (rel_posix, entry) in &entries_by_rel {
             let Some(&from_handle) = handle_by_rel.get(rel_posix) else {
                 continue;
@@ -259,6 +276,18 @@ impl FsExtractor {
                             builder.add_relative(from_handle, peer_handle);
                         }
                     }
+                }
+                let rel_path = Path::new(rel_posix);
+                match classify_workspace_file(rel_path) {
+                    FlatArtifactDomain::Code => {
+                        let portal = flat_code_portal(rel_path);
+                        builder.add_relative(from_handle, EdgeTarget::external_root(portal));
+                    }
+                    FlatArtifactDomain::DocOrMedia => {
+                        let portal = flat_doc_portal(rel_path);
+                        builder.add_relative(from_handle, EdgeTarget::external_root(portal));
+                    }
+                    FlatArtifactDomain::FsOnly => {}
                 }
             }
         }

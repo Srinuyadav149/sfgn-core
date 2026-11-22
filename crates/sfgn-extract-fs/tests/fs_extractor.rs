@@ -225,3 +225,66 @@ fn git_commit_all(dir: &Path, msg: &str) {
         .status()
         .expect("git commit");
 }
+
+#[test]
+fn skips_generated_sfgn_artifacts_and_emits_lazy_portals() {
+    struct TempDirGuard(std::path::PathBuf);
+    impl Drop for TempDirGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    let unique = format!(
+        "sfgn_fs_lazy_portals_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let root = std::env::temp_dir().join(unique);
+    let _guard = TempDirGuard(root.clone());
+
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::create_dir_all(root.join("resources")).unwrap();
+    std::fs::write(root.join("Cargo.toml"), "[package]\nname = \"demo\"\n").unwrap();
+    std::fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
+    std::fs::write(root.join("README.md"), "# Demo\n").unwrap();
+    std::fs::write(root.join("resources/logo.svg"), "<svg></svg>\n").unwrap();
+
+    // Pre-existing generated artifacts in workspace root must be ignored
+    std::fs::write(root.join("fs.sfgn"), ">:\n  \"kind\": \"filesystem\"\n").unwrap();
+    std::fs::create_dir_all(root.join("sfgn-codes")).unwrap();
+    std::fs::write(
+        root.join("sfgn-codes/src:main.rs.sfgn"),
+        ">:\n  \"kind\": \"code_file\"\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(root.join("sfgn-docs")).unwrap();
+    std::fs::write(
+        root.join("sfgn-docs/README.md.sfgn"),
+        ">:\n  \"kind\": \"document\"\n",
+    )
+    .unwrap();
+
+    let extractor = sfgn_extract_fs::FsExtractor::default();
+    let sfgn = extractor.extract(&root).expect("extract fs.sfgn");
+    let doc = sfgn_core::Document::parse(&sfgn).expect("valid sfgn");
+
+    // Generated artifacts are not indexed
+    assert!(!sfgn.contains("\"fs.sfgn\":"));
+    assert!(!sfgn.contains("\"sfgn-codes\""));
+    assert!(!sfgn.contains("\"sfgn-docs\":"));
+
+    // Lazy portals are emitted on code, doc, and media nodes—but not Cargo.toml
+    assert!(sfgn.contains("<\"sfgn-codes/src:main.rs.sfgn\">"));
+    assert!(sfgn.contains("<\"sfgn-docs/README.md.sfgn\">"));
+    assert!(sfgn.contains("<\"sfgn-docs/resources:logo.svg.sfgn\">"));
+
+    let cargo_slice = doc
+        .node_slice_by_path("\"Cargo.toml\"")
+        .unwrap()
+        .expect("Cargo.toml node");
+    assert!(!cargo_slice.contains("<\"sfgn-"));
+}

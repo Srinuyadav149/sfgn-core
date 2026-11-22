@@ -1,36 +1,41 @@
 use std::env;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use sfgn_core::{Document, MermaidDirection, render_ascii_tree, render_mermaid_with_direction};
-use sfgn_extract_docs::{DocsExtractOptions, DocsExtractor};
+use sfgn_core::{
+    Document, MermaidDirection, flat_doc_artifact_rel, render_ascii_tree,
+    render_mermaid_with_direction,
+};
+use sfgn_extract_docs::extract_doc_file_to_sfgn;
 
 fn main() {
-    let target = env::args().nth(1).unwrap_or_else(|| ".".to_owned());
-    let target_path = Path::new(&target);
+    let positionals: Vec<String> = env::args().skip(1).collect();
+    let (workspace_root, rel_file) = resolve_workspace_and_doc(&positionals);
 
-    let extractor = DocsExtractor::new(DocsExtractOptions {
-        fs_portal_file: Some("fs.sfgn".to_owned()),
-        code_portal_file: Some("code.sfgn".to_owned()),
-        ..DocsExtractOptions::default()
-    });
-
-    let doc_sfgn = extractor.extract(target_path).unwrap_or_else(|err| {
-        eprintln!("Failed to extract SFGN documentation graph: {}", err);
+    let doc_sfgn = extract_doc_file_to_sfgn(&workspace_root, &rel_file).unwrap_or_else(|err| {
+        eprintln!(
+            "Failed to extract SFGN document graph for '{}': {}",
+            rel_file.display(),
+            err
+        );
         std::process::exit(1);
     });
 
     let doc = Document::parse(&doc_sfgn).unwrap_or_else(|err| {
-        eprintln!("Validation failed on generated doc.sfgn: {}", err);
+        eprintln!("Validation failed on generated document .sfgn: {}", err);
         std::process::exit(1);
     });
 
-    let out_file = Path::new("target/workspace_docs.sfgn");
+    let artifact_rel = flat_doc_artifact_rel(&rel_file);
+    let out_file = Path::new("target").join(&artifact_rel);
     if let Some(parent) = out_file.parent() {
         let _ = fs::create_dir_all(parent);
     }
-    if fs::write(out_file, &doc_sfgn).is_ok() {
-        println!("Saved generated doc.sfgn to: {}\n", out_file.display());
+    if fs::write(&out_file, &doc_sfgn).is_ok() {
+        println!(
+            "Saved single-document SFGN graph to: {}\n",
+            out_file.display()
+        );
     }
 
     let total_child_edges: usize = doc.nodes().map(|n| n.children().count()).sum();
@@ -39,7 +44,8 @@ fn main() {
 
     println!("============================================================");
     println!(
-        "1. GENERATED doc.sfgn ({} nodes, {} > edges, {} >> links, {} external portals, {} bytes)",
+        "1. GENERATED {} ({} nodes, {} > edges, {} >> anchors, {} external portals, {} bytes)",
+        artifact_rel.display(),
         doc.len(),
         total_child_edges,
         total_rel_edges,
@@ -61,4 +67,35 @@ fn main() {
         "{}",
         render_mermaid_with_direction(&doc, MermaidDirection::LeftRight)
     );
+}
+
+fn resolve_workspace_and_doc(positionals: &[String]) -> (PathBuf, PathBuf) {
+    match positionals.len() {
+        0 => {
+            let root = PathBuf::from(".");
+            let default_doc = if root.join("README.md").is_file() {
+                PathBuf::from("README.md")
+            } else {
+                PathBuf::from("ARCHITECTURE.md")
+            };
+            (root, default_doc)
+        }
+        1 => {
+            let arg = PathBuf::from(&positionals[0]);
+            if arg.is_file() {
+                (PathBuf::from("."), arg)
+            } else {
+                let default_doc = if arg.join("README.md").is_file() {
+                    PathBuf::from("README.md")
+                } else {
+                    PathBuf::from("ARCHITECTURE.md")
+                };
+                (arg, default_doc)
+            }
+        }
+        _ => (
+            PathBuf::from(&positionals[0]),
+            PathBuf::from(&positionals[1]),
+        ),
+    }
 }

@@ -278,3 +278,75 @@ EOL          = #x0A | "\r\n" ;
     assert!(gbnf.contains("digit ::= [0-9]"));
     assert!(gbnf.contains("eol ::= \"\\x0a\" | \"\\r\\n\""));
 }
+#[test]
+fn extracts_single_markdown_and_media_file_with_lazy_flat_portals() {
+    let dir = TempDocsDir::new("sfgn_docs_single_file");
+
+    dir.write_str(
+        "docs/guide.md",
+        r###"# User Guide
+
+See [Details](#details), [Releasing](../resources/releasing.md),
+[Main Source](../src/main.rs), [Banner](../resources/banner.svg),
+and [Manifest](../Cargo.toml).
+
+## Details
+
+Local section content.
+"###,
+    );
+    dir.write_str("resources/releasing.md", "# Releasing\n");
+    dir.write_str("resources/banner.svg", "<svg></svg>\n");
+    dir.write_str("src/main.rs", "fn main() {}\n");
+    dir.write_str("Cargo.toml", "[package]\nname = \"demo\"\n");
+
+    // Extract only `docs/guide.md` into its flat document graph
+    let guide_sfgn = sfgn_extract_docs::extract_doc_file_to_sfgn(&dir.path, "docs/guide.md")
+        .expect("extract single markdown file");
+    let guide_doc = Document::parse(&guide_sfgn).expect("valid guide sfgn");
+
+    assert!(guide_sfgn.contains("\"kind\": \"document\""));
+    assert!(guide_sfgn.contains("\"source_file\": \"docs/guide.md\""));
+    assert!(guide_sfgn.contains("\"User Guide\":"));
+    assert!(guide_sfgn.contains("\"Details\":"));
+
+    let user_guide = guide_doc
+        .node_by_path(r###""User Guide""###)
+        .unwrap()
+        .expect("User Guide node");
+
+    // Local `#details` anchor resolves to local section node
+    let local_rels: Vec<String> = user_guide
+        .relatives()
+        .map(|n| n.canonical_path().unwrap().to_string())
+        .collect();
+    assert_eq!(local_rels, vec![r###""Details""###.to_owned()]);
+
+    // External links resolve to flat `sfgn-docs/`, `sfgn-codes/`, and `fs.sfgn` portals
+    let portals: Vec<(String, Option<String>)> = user_guide
+        .external_portals()
+        .map(|p| (p.file_path.to_owned(), p.sub_path.map(|s| s.to_string())))
+        .collect();
+    assert!(portals.contains(&("sfgn-docs/resources:releasing.md.sfgn".to_owned(), None)));
+    assert!(portals.contains(&("sfgn-codes/src:main.rs.sfgn".to_owned(), None)));
+    assert!(portals.contains(&("sfgn-docs/resources:banner.svg.sfgn".to_owned(), None)));
+    assert!(portals.contains(&("fs.sfgn".to_owned(), Some(r###""Cargo.toml""###.to_owned()))));
+
+    // Extract single media proxy (`resources/banner.svg`)
+    let svg_sfgn = sfgn_extract_docs::extract_doc_file_to_sfgn(&dir.path, "resources/banner.svg")
+        .expect("extract single svg media proxy");
+    let svg_doc = Document::parse(&svg_sfgn).expect("valid svg sfgn");
+    assert_eq!(
+        svg_doc.root().property("kind").unwrap().decode().unwrap(),
+        Value::Scalar(Scalar::String("media_proxy".into()))
+    );
+    assert_eq!(
+        svg_doc
+            .root()
+            .property("source_file")
+            .unwrap()
+            .decode()
+            .unwrap(),
+        Value::Scalar(Scalar::String("resources/banner.svg".into()))
+    );
+}

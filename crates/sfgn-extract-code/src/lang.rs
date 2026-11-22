@@ -49,6 +49,17 @@ impl LanguageKind {
     }
 }
 
+/// Structured import binding extracted from a source file for zero-parse cross-file portal resolution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ImportBinding {
+    /// Local identifier bound in the importing file (e.g., `"SfgnBuilder"`, `"run_lsblk"`).
+    pub local_name: String,
+    /// Path segments for path-based imports (e.g., `["crate", "error", "CodeExtractError"]`).
+    pub path_segments: Vec<String>,
+    /// String module specifier for JS/TS relative imports (e.g., `"./utils"`).
+    pub module_specifier: Option<String>,
+}
+
 /// Extracted syntactic item from a single source file.
 #[derive(Debug, Clone)]
 pub(crate) struct ExtractedSymbol {
@@ -63,6 +74,8 @@ pub(crate) struct ExtractedSymbol {
     pub children: Vec<ExtractedSymbol>,
     pub calls: Vec<String>,
     pub type_refs: Vec<String>,
+    /// `true` when this item is an external module declaration (`mod foo;`) without an inline `{ ... }` body.
+    pub is_external_mod: bool,
 }
 
 impl ExtractedSymbol {
@@ -95,6 +108,7 @@ pub(crate) struct ExtractedFile {
     pub language: LanguageKind,
     pub doc: Option<String>,
     pub imports: Vec<String>,
+    pub import_bindings: Vec<ImportBinding>,
     pub symbols: Vec<ExtractedSymbol>,
 }
 
@@ -185,6 +199,7 @@ fn set_parser_language(parser: &mut Parser, path: &Path, lang: LanguageKind) -> 
 #[cfg(feature = "rust")]
 fn extract_rust_file(root: Node<'_>, src: &str) -> ExtractedFile {
     let mut imports = BTreeSet::new();
+    let mut import_bindings = Vec::new();
     let mut symbols = Vec::new();
     let mut doc_lines: Vec<String> = Vec::new();
 
@@ -197,6 +212,10 @@ fn extract_rust_file(root: Node<'_>, src: &str) -> ExtractedFile {
             }
         } else if child.kind() == "use_declaration" {
             collect_rust_use_targets(child, src, &mut imports);
+            if let Some(arg) = child.child_by_field_name("argument") {
+                let mut prefix = Vec::new();
+                collect_rust_use_bindings(arg, src, &mut prefix, &mut import_bindings);
+            }
         } else if let Some(sym) = extract_rust_item(child, src) {
             symbols.push(sym);
         }
@@ -214,6 +233,7 @@ fn extract_rust_file(root: Node<'_>, src: &str) -> ExtractedFile {
         language: LanguageKind::Rust,
         doc,
         imports: imports.into_iter().collect(),
+        import_bindings,
         symbols,
     }
 }
@@ -266,8 +286,10 @@ fn extract_rust_item(node: Node<'_>, src: &str) -> Option<ExtractedSymbol> {
     };
 
     let signature = extract_signature_before_body(node, src, b'{');
+    let body_opt = node.child_by_field_name("body");
+    let is_external_mod = node.kind() == "mod_item" && body_opt.is_none();
 
-    if let Some(body) = node.child_by_field_name("body") {
+    if let Some(body) = body_opt {
         match node.kind() {
             "mod_item" => {
                 let mut cursor = body.walk();
@@ -319,6 +341,7 @@ fn extract_rust_item(node: Node<'_>, src: &str) -> Option<ExtractedSymbol> {
         children,
         calls: calls.into_iter().collect(),
         type_refs: type_refs.into_iter().collect(),
+        is_external_mod,
     })
 }
 
@@ -365,6 +388,7 @@ fn extract_rust_method(
         children: Vec::new(),
         calls: calls.into_iter().collect(),
         type_refs: type_refs.into_iter().collect(),
+        is_external_mod: false,
     })
 }
 
@@ -429,6 +453,127 @@ fn collect_rust_use_targets(node: Node<'_>, src: &str, imports: &mut BTreeSet<St
         let mut cursor = curr.walk();
         for child in curr.children(&mut cursor) {
             stack.push(child);
+        }
+    }
+}
+
+#[cfg(feature = "rust")]
+fn collect_rust_use_bindings(
+    node: Node<'_>,
+    src: &str,
+    prefix: &mut Vec<String>,
+    out: &mut Vec<ImportBinding>,
+) {
+    match node.kind() {
+        "identifier" | "type_identifier" | "crate" | "super" | "self" => {
+            let seg = node_text(node, src).trim();
+            if !seg.is_empty() {
+                let mut full = prefix.clone();
+                full.push(seg.to_owned());
+                out.push(ImportBinding {
+                    local_name: seg.to_owned(),
+                    path_segments: full,
+                    module_specifier: None,
+                });
+            }
+        }
+        "scoped_identifier" => {
+            let mut segments = Vec::new();
+            flatten_rust_scoped_path(node, src, &mut segments);
+            if let Some(last) = segments.last().cloned() {
+                let mut full = prefix.clone();
+                full.extend(segments);
+                out.push(ImportBinding {
+                    local_name: last,
+                    path_segments: full,
+                    module_specifier: None,
+                });
+            }
+        }
+        "scoped_use_list" => {
+            let base_len = prefix.len();
+            if let Some(path_node) = node.child_by_field_name("path") {
+                flatten_rust_scoped_path(path_node, src, prefix);
+            }
+            if let Some(list_node) = node.child_by_field_name("list") {
+                collect_rust_use_bindings(list_node, src, prefix, out);
+            }
+            prefix.truncate(base_len);
+        }
+        "use_list" => {
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                if matches!(child.kind(), "{" | "}" | ",") {
+                    continue;
+                }
+                collect_rust_use_bindings(child, src, prefix, out);
+            }
+        }
+        "use_as_clause" => {
+            let mut segments = prefix.clone();
+            if let Some(path_node) = node.child_by_field_name("path") {
+                flatten_rust_scoped_path(path_node, src, &mut segments);
+            }
+            let local_name = node
+                .child_by_field_name("alias")
+                .map(|n| node_text(n, src).trim().to_owned())
+                .or_else(|| segments.last().cloned())
+                .unwrap_or_default();
+            if !local_name.is_empty() && !segments.is_empty() {
+                out.push(ImportBinding {
+                    local_name,
+                    path_segments: segments,
+                    module_specifier: None,
+                });
+            }
+        }
+        "use_wildcard" => {
+            let mut segments = prefix.clone();
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                if !matches!(child.kind(), "::" | "*") {
+                    flatten_rust_scoped_path(child, src, &mut segments);
+                }
+            }
+            if !segments.is_empty() {
+                out.push(ImportBinding {
+                    local_name: "*".to_owned(),
+                    path_segments: segments,
+                    module_specifier: None,
+                });
+            }
+        }
+        _ => {}
+    }
+}
+
+#[cfg(feature = "rust")]
+fn flatten_rust_scoped_path(node: Node<'_>, src: &str, out: &mut Vec<String>) {
+    match node.kind() {
+        "scoped_identifier" => {
+            if let Some(path_node) = node.child_by_field_name("path") {
+                flatten_rust_scoped_path(path_node, src, out);
+            }
+            if let Some(name_node) = node.child_by_field_name("name") {
+                let seg = node_text(name_node, src).trim();
+                if !seg.is_empty() {
+                    out.push(seg.to_owned());
+                }
+            }
+        }
+        "identifier" | "type_identifier" | "crate" | "super" | "self" => {
+            let seg = node_text(node, src).trim();
+            if !seg.is_empty() {
+                out.push(seg.to_owned());
+            }
+        }
+        _ => {
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                if child.kind() != "::" {
+                    flatten_rust_scoped_path(child, src, out);
+                }
+            }
         }
     }
 }
@@ -532,6 +677,7 @@ fn is_builtin_rust_type(ty: &str) -> bool {
 #[cfg(feature = "python")]
 fn extract_python_file(root: Node<'_>, src: &str) -> ExtractedFile {
     let mut imports = BTreeSet::new();
+    let mut import_bindings = Vec::new();
     let mut symbols = Vec::new();
     let mut cursor = root.walk();
 
@@ -545,6 +691,7 @@ fn extract_python_file(root: Node<'_>, src: &str) -> ExtractedFile {
         match actual.kind() {
             "import_statement" | "import_from_statement" => {
                 collect_python_imports(actual, src, &mut imports);
+                collect_python_import_bindings(actual, src, &mut import_bindings);
             }
             "class_definition" => {
                 if let Some(sym) = extract_python_class(child, actual, src) {
@@ -564,6 +711,7 @@ fn extract_python_file(root: Node<'_>, src: &str) -> ExtractedFile {
         language: LanguageKind::Python,
         doc: extract_python_docstring(root, src),
         imports: imports.into_iter().collect(),
+        import_bindings,
         symbols,
     }
 }
@@ -626,6 +774,7 @@ fn extract_python_class(
         children,
         calls: Vec::new(),
         type_refs: type_refs.into_iter().collect(),
+        is_external_mod: false,
     })
 }
 
@@ -672,6 +821,7 @@ fn extract_python_function(
         children: Vec::new(),
         calls: calls.into_iter().collect(),
         type_refs: Vec::new(),
+        is_external_mod: false,
     })
 }
 
@@ -723,6 +873,109 @@ fn collect_python_imports(node: Node<'_>, src: &str, imports: &mut BTreeSet<Stri
 }
 
 #[cfg(feature = "python")]
+fn collect_python_import_bindings(node: Node<'_>, src: &str, out: &mut Vec<ImportBinding>) {
+    if node.kind() == "import_from_statement" {
+        let mut module_segments: Vec<String> = Vec::new();
+        if let Some(mod_node) = node.child_by_field_name("module_name") {
+            let raw = node_text(mod_node, src).trim();
+            let dots_len = raw.chars().take_while(|&c| c == '.').count();
+            if dots_len > 0 {
+                module_segments.push(".".repeat(dots_len));
+            }
+            let rest = &raw[dots_len..];
+            for part in rest.split('.').filter(|s| !s.is_empty()) {
+                module_segments.push(part.to_owned());
+            }
+        }
+
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if Some(child) == node.child_by_field_name("module_name") {
+                continue;
+            }
+            match child.kind() {
+                "dotted_name" | "identifier" => {
+                    let sym = node_text(child, src).trim();
+                    if !sym.is_empty() {
+                        let mut segs = module_segments.clone();
+                        segs.push(sym.to_owned());
+                        out.push(ImportBinding {
+                            local_name: sym.rsplit('.').next().unwrap_or(sym).to_owned(),
+                            path_segments: segs,
+                            module_specifier: None,
+                        });
+                    }
+                }
+                "aliased_import" => {
+                    let orig = child
+                        .child_by_field_name("name")
+                        .map(|n| node_text(n, src).trim().to_owned())
+                        .unwrap_or_default();
+                    let alias = child
+                        .child_by_field_name("alias")
+                        .map(|n| node_text(n, src).trim().to_owned())
+                        .unwrap_or_else(|| orig.clone());
+                    if !orig.is_empty() {
+                        let mut segs = module_segments.clone();
+                        segs.push(orig);
+                        out.push(ImportBinding {
+                            local_name: alias,
+                            path_segments: segs,
+                            module_specifier: None,
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+    } else if node.kind() == "import_statement" {
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            match child.kind() {
+                "dotted_name" => {
+                    let raw = node_text(child, src).trim();
+                    let segs: Vec<String> = raw
+                        .split('.')
+                        .filter(|s| !s.is_empty())
+                        .map(ToOwned::to_owned)
+                        .collect();
+                    if let Some(first) = segs.first().cloned() {
+                        out.push(ImportBinding {
+                            local_name: first,
+                            path_segments: segs,
+                            module_specifier: None,
+                        });
+                    }
+                }
+                "aliased_import" => {
+                    let orig = child
+                        .child_by_field_name("name")
+                        .map(|n| node_text(n, src).trim().to_owned())
+                        .unwrap_or_default();
+                    let alias = child
+                        .child_by_field_name("alias")
+                        .map(|n| node_text(n, src).trim().to_owned())
+                        .unwrap_or_default();
+                    let segs: Vec<String> = orig
+                        .split('.')
+                        .filter(|s| !s.is_empty())
+                        .map(ToOwned::to_owned)
+                        .collect();
+                    if !segs.is_empty() && !alias.is_empty() {
+                        out.push(ImportBinding {
+                            local_name: alias,
+                            path_segments: segs,
+                            module_specifier: None,
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+#[cfg(feature = "python")]
 fn collect_python_calls(
     node: Node<'_>,
     src: &str,
@@ -752,6 +1005,7 @@ fn collect_python_calls(
 #[cfg(feature = "typescript")]
 fn extract_ts_file(root: Node<'_>, src: &str, lang: LanguageKind) -> ExtractedFile {
     let mut imports = BTreeSet::new();
+    let mut import_bindings = Vec::new();
     let mut symbols = Vec::new();
     let mut cursor = root.walk();
 
@@ -767,6 +1021,7 @@ fn extract_ts_file(root: Node<'_>, src: &str, lang: LanguageKind) -> ExtractedFi
 
         if actual.kind() == "import_statement" {
             collect_ts_imports(actual, src, &mut imports);
+            collect_ts_import_bindings(actual, src, &mut import_bindings);
         } else if let Some(sym) = extract_ts_item(child, actual, src, exported) {
             symbols.push(sym);
         }
@@ -776,6 +1031,7 @@ fn extract_ts_file(root: Node<'_>, src: &str, lang: LanguageKind) -> ExtractedFi
         language: lang,
         doc: None,
         imports: imports.into_iter().collect(),
+        import_bindings,
         symbols,
     }
 }
@@ -846,6 +1102,7 @@ fn extract_ts_item(
         children,
         calls: calls.into_iter().collect(),
         type_refs: type_refs.into_iter().collect(),
+        is_external_mod: false,
     })
 }
 
@@ -882,6 +1139,7 @@ fn extract_ts_method(
         children: Vec::new(),
         calls: calls.into_iter().collect(),
         type_refs: type_refs.into_iter().collect(),
+        is_external_mod: false,
     })
 }
 
@@ -898,6 +1156,63 @@ fn collect_ts_imports(node: Node<'_>, src: &str, imports: &mut BTreeSet<String>)
         let mut cursor = curr.walk();
         for child in curr.children(&mut cursor) {
             stack.push(child);
+        }
+    }
+}
+
+#[cfg(feature = "typescript")]
+fn collect_ts_import_bindings(node: Node<'_>, src: &str, out: &mut Vec<ImportBinding>) {
+    let Some(source_node) = node.child_by_field_name("source") else {
+        return;
+    };
+    let raw_spec = node_text(source_node, src).trim();
+    let specifier = raw_spec
+        .trim_start_matches(['"', '\''])
+        .trim_end_matches(['"', '\''])
+        .to_owned();
+    if specifier.is_empty() {
+        return;
+    }
+
+    let mut bound_names = Vec::new();
+    let mut stack = vec![node];
+    while let Some(curr) = stack.pop() {
+        if curr == source_node {
+            continue;
+        }
+        if curr.kind() == "import_specifier" {
+            if let Some(alias) = curr.child_by_field_name("alias") {
+                bound_names.push(node_text(alias, src).trim().to_owned());
+            } else if let Some(name) = curr.child_by_field_name("name") {
+                bound_names.push(node_text(name, src).trim().to_owned());
+            }
+            continue;
+        }
+        if curr.kind() == "identifier" {
+            let ident = node_text(curr, src).trim();
+            if !ident.is_empty() {
+                bound_names.push(ident.to_owned());
+            }
+        }
+        let mut cursor = curr.walk();
+        for child in curr.children(&mut cursor) {
+            stack.push(child);
+        }
+    }
+
+    if bound_names.is_empty() {
+        out.push(ImportBinding {
+            local_name: "*".to_owned(),
+            path_segments: Vec::new(),
+            module_specifier: Some(specifier),
+        });
+    } else {
+        for local_name in bound_names {
+            out.push(ImportBinding {
+                local_name,
+                path_segments: Vec::new(),
+                module_specifier: Some(specifier.clone()),
+            });
         }
     }
 }
