@@ -5,10 +5,15 @@ pub mod media;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
-use std::path::Path;
+use std::io;
+use std::path::{Component, Path};
 
 use ignore::WalkBuilder;
-use sfgn_core::{EdgeTarget, IndentStyle, NodeHandle, SfgnBuilder, SfgnScalar};
+use sfgn_core::{
+    EdgeTarget, FS_GRAPH_FILE, FlatArtifactDomain, IndentStyle, NodeHandle, SfgnBuilder,
+    SfgnScalar, classify_workspace_file, flat_code_portal, flat_doc_portal,
+    is_generated_sfgn_artifact,
+};
 
 pub use error::{DocsExtractError, Result};
 pub use gbnf::{compile_ebnf_to_gbnf, normalize_gbnf_rule_name};
@@ -32,7 +37,7 @@ pub struct DocsExtractOptions {
     pub code_portal_file: Option<String>,
     /// Maximum Markdown file size in bytes to parse (default `4 MiB`).
     pub max_markdown_bytes: u64,
-    /// Depth 1 indentation style for emitted `doc.sfgn`.
+    /// Depth 1 indentation style for emitted `.sfgn` files.
     pub indent: IndentStyle,
 }
 
@@ -56,7 +61,8 @@ struct PendingDocLink {
     raw_target: String,
 }
 
-/// Deterministic Markdown outline/table compiler and binary media proxy scanner emitting `doc.sfgn`.
+/// Deterministic Markdown outline/table compiler and binary media proxy scanner emitting `doc.sfgn`
+/// and lazy per-file `sfgn-docs/<encoded>.sfgn` graphs.
 #[derive(Debug, Clone, Default)]
 pub struct DocsExtractor {
     options: DocsExtractOptions,
@@ -67,8 +73,305 @@ impl DocsExtractor {
         Self { options }
     }
 
+    /// Lazily compiles a single workspace Markdown document or media asset (`rel_file_path`,
+    /// e.g. `"README.md"` or `"resources/banner.png"`) into its standalone flat `.sfgn` graph:
+    /// - Markdown files emit `"kind": "document"` with top-level headings attached directly to `>:`.
+    /// - Media assets emit `"kind": "media_proxy"` with parsed header dimensions/timing/metadata.
+    /// - Same-document `#anchor` links become local `>>` edges; cross-file links become flat
+    ///   `<"sfgn-docs/...">`, `<"sfgn-codes/...">`, or `<"fs.sfgn">` external portals without
+    ///   opening target files.
+    pub fn extract_file(
+        &self,
+        workspace_root: impl AsRef<Path>,
+        rel_file_path: impl AsRef<Path>,
+    ) -> Result<String> {
+        let root_path = workspace_root.as_ref();
+        let canon_root = fs::canonicalize(root_path).map_err(|source| DocsExtractError::Io {
+            path: root_path.to_path_buf(),
+            source,
+        })?;
+
+        let rel_posix = normalize_workspace_rel_path(rel_file_path.as_ref())?;
+        let abs_file = canon_root.join(&rel_posix);
+
+        let metadata = fs::metadata(&abs_file).map_err(|source| DocsExtractError::Io {
+            path: abs_file.clone(),
+            source,
+        })?;
+        if !metadata.is_file() {
+            return Err(DocsExtractError::Io {
+                path: abs_file,
+                source: io::Error::new(io::ErrorKind::InvalidInput, "target is not a regular file"),
+            });
+        }
+
+        let ext = Path::new(&rel_posix)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("");
+
+        let mut builder = SfgnBuilder::new().with_indent(self.options.indent);
+
+        if is_markdown_ext(ext) {
+            if metadata.len() > self.options.max_markdown_bytes {
+                return Err(DocsExtractError::Io {
+                    path: abs_file,
+                    source: io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "markdown size {} bytes exceeds max_markdown_bytes ({})",
+                            metadata.len(),
+                            self.options.max_markdown_bytes
+                        ),
+                    ),
+                });
+            }
+
+            let raw = fs::read_to_string(&abs_file).map_err(|source| DocsExtractError::Io {
+                path: abs_file.clone(),
+                source,
+            })?;
+            let md = parse_markdown(&raw);
+
+            builder.set_root_prop("kind", "document");
+            builder.set_root_prop("source_file", rel_posix.as_str());
+            builder.set_root_prop("sections", md.sections.len() as u64);
+
+            let mut anchor_handles: HashMap<String, NodeHandle> = HashMap::new();
+            let mut pending_links: Vec<PendingDocLink> = Vec::new();
+
+            if !md.preamble.is_empty() {
+                builder.add_multiline(NodeHandle::ROOT, "preamble", Some("md"), &md.preamble);
+            }
+            for raw_target in &md.preamble_links {
+                pending_links.push(PendingDocLink {
+                    from: NodeHandle::ROOT,
+                    source_file_posix: rel_posix.clone(),
+                    raw_target: raw_target.clone(),
+                });
+            }
+
+            // Attach top-level headings directly to `>:` (`NodeHandle::ROOT`)
+            let mut heading_stack: Vec<(u8, NodeHandle)> = Vec::new();
+
+            for sec in &md.sections {
+                while let Some(&(top_lvl, _)) = heading_stack.last() {
+                    if top_lvl >= sec.level {
+                        heading_stack.pop();
+                    } else {
+                        break;
+                    }
+                }
+                let sec_parent = heading_stack
+                    .last()
+                    .map(|&(_, h)| h)
+                    .unwrap_or(NodeHandle::ROOT);
+
+                let sec_label = if sec.title.is_empty() {
+                    format!("Section H{}", sec.level)
+                } else {
+                    sec.title.clone()
+                };
+
+                let sec_handle = builder.add_node(sec_parent, &sec_label);
+                builder.add_prop(sec_handle, "kind", "section");
+                builder.add_prop(sec_handle, "level", sec.level as u64);
+                builder.add_prop(sec_handle, "slug", sec.slug.as_str());
+                builder.add_prop(sec_handle, "source_file", rel_posix.as_str());
+
+                if !sec.content.is_empty() {
+                    builder.add_multiline(sec_handle, "content", Some("md"), &sec.content);
+                }
+
+                for (idx, tbl) in sec.tables.iter().enumerate() {
+                    if sec.tables.len() == 1 {
+                        builder.add_multiline(sec_handle, "table", Some("csv"), &tbl.csv);
+                        builder.add_prop(
+                            sec_handle,
+                            "table_shape",
+                            vec![SfgnScalar::from(tbl.rows), SfgnScalar::from(tbl.cols)],
+                        );
+                    } else {
+                        let key = format!("table_{}", idx);
+                        let shape_key = format!("table_{}_shape", idx);
+                        builder.add_multiline(sec_handle, &key, Some("csv"), &tbl.csv);
+                        builder.add_prop(
+                            sec_handle,
+                            &shape_key,
+                            vec![SfgnScalar::from(tbl.rows), SfgnScalar::from(tbl.cols)],
+                        );
+                    }
+                }
+
+                for (idx, cb) in sec.code_blocks.iter().enumerate() {
+                    let tag = cb.language.as_deref();
+                    if sec.code_blocks.len() == 1 {
+                        builder.add_multiline(sec_handle, "code", tag, &cb.code);
+                    } else {
+                        let key = format!("code_{}", idx);
+                        builder.add_multiline(sec_handle, &key, tag, &cb.code);
+                    }
+                }
+
+                if !sec.slug.is_empty() {
+                    anchor_handles.entry(sec.slug.clone()).or_insert(sec_handle);
+                }
+
+                for raw_target in &sec.links {
+                    pending_links.push(PendingDocLink {
+                        from: sec_handle,
+                        source_file_posix: rel_posix.clone(),
+                        raw_target: raw_target.clone(),
+                    });
+                }
+
+                heading_stack.push((sec.level, sec_handle));
+            }
+
+            // Resolve intra-document `#anchor` edges locally and cross-file links to flat portals
+            let mut seen_local: BTreeSet<(NodeHandle, NodeHandle)> = BTreeSet::new();
+            let mut seen_external: BTreeSet<(NodeHandle, String, Option<String>)> = BTreeSet::new();
+
+            for link in pending_links {
+                if let Some(anchor) = link.raw_target.strip_prefix('#') {
+                    let slug = slugify_heading(anchor);
+                    if let Some(&target_h) = anchor_handles.get(&slug) {
+                        if target_h != link.from && seen_local.insert((link.from, target_h)) {
+                            builder.add_relative(link.from, target_h);
+                        }
+                    }
+                    continue;
+                }
+
+                let (path_part, anchor_part) = match link.raw_target.split_once('#') {
+                    Some((p, a)) => (p, Some(slugify_heading(a))),
+                    None => (link.raw_target.as_str(), None),
+                };
+                if path_part.is_empty() {
+                    continue;
+                }
+
+                let resolved_rel = resolve_relative_posix(&link.source_file_posix, path_part);
+
+                // Self-document link with `#anchor`
+                if resolved_rel == link.source_file_posix {
+                    if let Some(slug) = anchor_part {
+                        if let Some(&target_h) = anchor_handles.get(&slug) {
+                            if target_h != link.from && seen_local.insert((link.from, target_h)) {
+                                builder.add_relative(link.from, target_h);
+                            }
+                        }
+                    }
+                    continue;
+                }
+
+                if resolved_rel.ends_with(".sfgn") {
+                    if seen_external.insert((link.from, resolved_rel.clone(), None)) {
+                        builder.add_relative(link.from, EdgeTarget::external_root(resolved_rel));
+                    }
+                    continue;
+                }
+
+                let target_path = Path::new(&resolved_rel);
+                let target_ext = target_path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("");
+
+                match classify_workspace_file(target_path) {
+                    FlatArtifactDomain::DocOrMedia => {
+                        let portal = flat_doc_portal(target_path);
+                        if seen_external.insert((link.from, portal.clone(), None)) {
+                            builder.add_relative(link.from, EdgeTarget::external_root(portal));
+                        }
+                    }
+                    FlatArtifactDomain::Code => {
+                        let portal = flat_code_portal(target_path);
+                        if seen_external.insert((link.from, portal.clone(), None)) {
+                            builder.add_relative(link.from, EdgeTarget::external_root(portal));
+                        }
+                    }
+                    FlatArtifactDomain::FsOnly => {
+                        if classify_media_extension(target_ext).is_some() {
+                            let portal = flat_doc_portal(target_path);
+                            if seen_external.insert((link.from, portal.clone(), None)) {
+                                builder.add_relative(link.from, EdgeTarget::external_root(portal));
+                            }
+                        } else {
+                            let sub_path = posix_path_to_sfgn_node_path(&resolved_rel);
+                            if !sub_path.is_empty()
+                                && seen_external.insert((
+                                    link.from,
+                                    FS_GRAPH_FILE.to_owned(),
+                                    Some(sub_path.clone()),
+                                ))
+                            {
+                                builder.add_relative(
+                                    link.from,
+                                    EdgeTarget::external_node(FS_GRAPH_FILE, sub_path),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
+            return Ok(builder.build()?);
+        }
+
+        // Media / vector asset proxy (`media_proxy`)
+        let proxy = if ext.eq_ignore_ascii_case("svg") {
+            MediaProxyMeta {
+                category: MediaCategory::Image,
+                mime_type: "image/svg+xml",
+                size_bytes: metadata.len(),
+                width: None,
+                height: None,
+                duration_secs: None,
+                sample_rate_hz: None,
+                channels: None,
+                detail: None,
+            }
+        } else {
+            inspect_media_file(&abs_file, metadata.len()).ok_or_else(|| DocsExtractError::Io {
+                path: abs_file.clone(),
+                source: io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("unsupported document or media file extension '.{}'", ext),
+                ),
+            })?
+        };
+
+        builder.set_root_prop("kind", "media_proxy");
+        builder.set_root_prop("media_type", proxy.category.as_str());
+        builder.set_root_prop("mime_type", proxy.mime_type);
+        builder.set_root_prop("source_file", rel_posix.as_str());
+        builder.set_root_prop("size_bytes", proxy.size_bytes);
+
+        if let Some(w) = proxy.width {
+            builder.set_root_prop("width", w as u64);
+        }
+        if let Some(h) = proxy.height {
+            builder.set_root_prop("height", h as u64);
+        }
+        if let Some(sr) = proxy.sample_rate_hz {
+            builder.set_root_prop("sample_rate_hz", sr as u64);
+        }
+        if let Some(ch) = proxy.channels {
+            builder.set_root_prop("channels", ch as u64);
+        }
+        if let Some(dur) = proxy.duration_secs {
+            builder.set_root_prop("duration_secs", dur);
+        }
+        if let Some(detail) = &proxy.detail {
+            builder.set_root_prop("detail", detail.as_str());
+        }
+
+        Ok(builder.build()?)
+    }
+
     /// Walks `root_dir`, compiles Markdown files (`H1 > H2 > H3`, prose, fenced code, CSV tables,
-    /// and internal/cross-doc links) plus binary media proxies into canonical `doc.sfgn`.
+    /// and internal/cross-doc links) plus binary media proxies into canonical monolithic `doc.sfgn`.
     pub fn extract(&self, root_dir: impl AsRef<Path>) -> Result<String> {
         let root_path = root_dir.as_ref();
         let canon_root = fs::canonicalize(root_path).map_err(|source| DocsExtractError::Io {
@@ -76,12 +379,23 @@ impl DocsExtractor {
             source,
         })?;
 
+        let filter_root = canon_root.clone();
         let mut walker = WalkBuilder::new(&canon_root);
         walker
             .hidden(false)
             .require_git(false)
             .follow_links(false)
-            .filter_entry(|entry| entry.file_name() != ".git");
+            .filter_entry(move |entry| {
+                if entry.file_name() == ".git" {
+                    return false;
+                }
+                if let Ok(rel) = entry.path().strip_prefix(&filter_root) {
+                    if is_generated_sfgn_artifact(rel) {
+                        return false;
+                    }
+                }
+                true
+            });
 
         let mut md_files: BTreeMap<String, (String, ExtractedMarkdown)> = BTreeMap::new();
         let mut media_files: BTreeMap<String, (String, MediaProxyMeta)> = BTreeMap::new();
@@ -107,6 +421,9 @@ impl DocsExtractor {
             let Ok(rel_path) = path.strip_prefix(&canon_root) else {
                 continue;
             };
+            if is_generated_sfgn_artifact(rel_path) {
+                continue;
+            }
             let rel_posix = path_to_posix(rel_path);
             if rel_posix.is_empty() {
                 continue;
@@ -410,9 +727,44 @@ impl DocsExtractor {
     }
 }
 
-/// Convenience function compiling `root_dir` into `doc.sfgn` using default `DocsExtractOptions`.
+/// Convenience function compiling `root_dir` into monolithic `doc.sfgn` using default `DocsExtractOptions`.
 pub fn extract_docs_to_sfgn(root_dir: impl AsRef<Path>) -> Result<String> {
     DocsExtractor::default().extract(root_dir)
+}
+
+/// Convenience function lazily compiling a single workspace-relative Markdown or media file
+/// (`rel_file_path`) into its flat `sfgn-docs/<encoded>.sfgn` document string.
+pub fn extract_doc_file_to_sfgn(
+    workspace_root: impl AsRef<Path>,
+    rel_file_path: impl AsRef<Path>,
+) -> Result<String> {
+    DocsExtractor::default().extract_file(workspace_root, rel_file_path)
+}
+
+fn normalize_workspace_rel_path(rel_path: &Path) -> Result<String> {
+    let mut parts = Vec::new();
+    for comp in rel_path.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::Normal(os) => parts.push(os.to_string_lossy().into_owned()),
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(DocsExtractError::Io {
+                    path: rel_path.to_path_buf(),
+                    source: io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "rel_file_path must be a relative path inside the workspace root",
+                    ),
+                });
+            }
+        }
+    }
+    if parts.is_empty() {
+        return Err(DocsExtractError::Io {
+            path: rel_path.to_path_buf(),
+            source: io::Error::new(io::ErrorKind::InvalidInput, "rel_file_path cannot be empty"),
+        });
+    }
+    Ok(parts.join("/"))
 }
 
 fn is_markdown_ext(ext: &str) -> bool {

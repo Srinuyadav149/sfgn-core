@@ -43,7 +43,7 @@ impl Drop for TempCliWorkspace {
 }
 
 #[test]
-fn end_to_end_cli_compile_check_slice_grep_viz_patch_and_gbnf() {
+fn end_to_end_cli_lazy_flat_compile_hydrate_slice_grep_viz_patch_and_gbnf() {
     let ws = TempCliWorkspace::new("sfgn_cli_e2e");
 
     ws.write(
@@ -66,14 +66,11 @@ pub fn add(a: i64, b: i64) -> i64 {
     );
 
     let bin = env!("CARGO_BIN_EXE_sfgn");
-    let out_dir = ws.path.join(".sfgn");
 
-    // 1. `sfgn compile`
+    // 1. `sfgn compile <ROOT_DIR>` creates root `fs.sfgn`, `sfgn-codes/`, and `sfgn-docs/`
     let compile_out = Command::new(bin)
         .arg("compile")
         .arg(&ws.path)
-        .arg("--out-dir")
-        .arg(&out_dir)
         .output()
         .expect("run sfgn compile");
     assert!(
@@ -81,24 +78,52 @@ pub fn add(a: i64, b: i64) -> i64 {
         "compile stderr: {}",
         String::from_utf8_lossy(&compile_out.stderr)
     );
-    assert!(out_dir.join("fs.sfgn").exists());
-    assert!(out_dir.join("code.sfgn").exists());
-    assert!(out_dir.join("doc.sfgn").exists());
+    assert!(ws.path.join("fs.sfgn").exists());
+    assert!(ws.path.join("sfgn-codes").is_dir());
+    assert!(ws.path.join("sfgn-docs").is_dir());
+    // Lazy by default: neither code nor doc artifact exists before hydration
+    assert!(!ws.path.join("sfgn-codes/src:math.rs.sfgn").exists());
+    assert!(!ws.path.join("sfgn-docs/README.md.sfgn").exists());
 
-    // 2. `sfgn check`
+    // 2. `sfgn check` on `fs.sfgn`
     let check_out = Command::new(bin)
         .arg("check")
-        .arg(out_dir.join("code.sfgn"))
+        .arg(ws.path.join("fs.sfgn"))
         .output()
         .expect("run sfgn check");
     assert!(check_out.status.success());
     assert!(String::from_utf8_lossy(&check_out.stdout).starts_with("OK:"));
 
-    // 3. `sfgn slice --follow-portals` (doc.sfgn -> fs.sfgn)
+    // 3. `sfgn hydrate` lazily compiles `sfgn-codes/src:math.rs.sfgn`
+    let hydrate_out = Command::new(bin)
+        .arg("hydrate")
+        .arg(&ws.path)
+        .arg("src/math.rs")
+        .output()
+        .expect("run sfgn hydrate");
+    assert!(
+        hydrate_out.status.success(),
+        "hydrate stderr: {}",
+        String::from_utf8_lossy(&hydrate_out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&hydrate_out.stdout).starts_with("Hydrated "));
+    assert!(ws.path.join("sfgn-codes/src:math.rs.sfgn").exists());
+
+    // Second hydrate without source modification hits mtime cache
+    let hydrate_cached = Command::new(bin)
+        .arg("hydrate")
+        .arg(&ws.path)
+        .arg("src/math.rs")
+        .output()
+        .expect("run cached sfgn hydrate");
+    assert!(hydrate_cached.status.success());
+    assert!(String::from_utf8_lossy(&hydrate_cached.stdout).starts_with("Up-to-date "));
+
+    // 4. `sfgn slice --follow-portals` on `fs.sfgn` auto-hydrates `sfgn-docs/README.md.sfgn`
     let slice_out = Command::new(bin)
         .arg("slice")
-        .arg(out_dir.join("doc.sfgn"))
-        .arg(r###""Math Crate""###)
+        .arg(ws.path.join("fs.sfgn"))
+        .arg(r###""README.md""###)
         .arg("--follow-portals")
         .output()
         .expect("run sfgn slice");
@@ -108,23 +133,24 @@ pub fn add(a: i64, b: i64) -> i64 {
         String::from_utf8_lossy(&slice_out.stderr)
     );
     let slice_stdout = String::from_utf8_lossy(&slice_out.stdout);
-    assert!(slice_stdout.contains(r###"Resolved Portal: <"fs.sfgn">"src">"math.rs""###));
-    assert!(slice_stdout.contains(r###""path": "src/math.rs""###));
+    assert!(slice_stdout.contains(r###"Resolved Portal: <"sfgn-docs/README.md.sfgn">"###));
+    assert!(slice_stdout.contains(r###""source_file": "README.md""###));
+    assert!(ws.path.join("sfgn-docs/README.md.sfgn").exists());
 
-    // 4. `sfgn grep`
+    // 5. `sfgn grep` on hydrated `sfgn-codes/src:math.rs.sfgn`
     let grep_out = Command::new(bin)
         .arg("grep")
-        .arg(out_dir.join("code.sfgn"))
+        .arg(ws.path.join("sfgn-codes/src:math.rs.sfgn"))
         .arg("Adds two integers")
         .output()
         .expect("run sfgn grep");
     assert!(grep_out.status.success());
     assert!(String::from_utf8_lossy(&grep_out.stdout).contains(r###""fn add""###));
 
-    // 5. `sfgn viz --mermaid --lr`
+    // 6. `sfgn viz --mermaid --lr` on hydrated `sfgn-docs/README.md.sfgn`
     let viz_out = Command::new(bin)
         .arg("viz")
-        .arg(out_dir.join("doc.sfgn"))
+        .arg(ws.path.join("sfgn-docs/README.md.sfgn"))
         .arg("--mermaid")
         .arg("--lr")
         .output()
@@ -132,12 +158,12 @@ pub fn add(a: i64, b: i64) -> i64 {
     assert!(viz_out.status.success());
     assert!(String::from_utf8_lossy(&viz_out.stdout).starts_with("graph LR\n"));
 
-    // 6. `sfgn patch`
+    // 7. `sfgn patch` splices `src/math.rs` and refreshes `sfgn-codes/src:math.rs.sfgn`
     let updated_fn = "pub fn add(a: i64, b: i64) -> i64 {\n    a.saturating_add(b)\n}";
     let patch_out = Command::new(bin)
         .arg("patch")
         .arg(&ws.path)
-        .arg(out_dir.join("code.sfgn"))
+        .arg(ws.path.join("sfgn-codes/src:math.rs.sfgn"))
         .arg(r###""fn add""###)
         .arg("--body")
         .arg(updated_fn)
@@ -149,8 +175,12 @@ pub fn add(a: i64, b: i64) -> i64 {
         String::from_utf8_lossy(&patch_out.stderr)
     );
     assert!(ws.read("src/math.rs").contains("a.saturating_add(b)"));
+    assert!(
+        ws.read("sfgn-codes/src:math.rs.sfgn")
+            .contains("a.saturating_add(b)")
+    );
 
-    // 7. `sfgn gbnf`
+    // 8. `sfgn gbnf`
     let gbnf_out = Command::new(bin)
         .arg("gbnf")
         .arg(ws.path.join("grammar.ebnf"))

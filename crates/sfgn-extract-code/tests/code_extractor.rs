@@ -192,3 +192,65 @@ impl TokenStore {
     assert!(disk_after.contains("pub fn validate(&self, raw: &str) -> Option<Claims>"));
     assert!(disk_after.contains("fn check_expiry(&self, _claims: &Claims) {}"));
 }
+#[test]
+fn extracts_single_file_with_lazy_external_portals() {
+    struct TempDirGuard(std::path::PathBuf);
+    impl Drop for TempDirGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    let unique = format!(
+        "sfgn_code_single_file_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let root = std::env::temp_dir().join(unique);
+    let _guard = TempDirGuard(root.clone());
+
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"demo_cli\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/lib.rs"),
+        "pub mod utils;\npub fn run_lsblk() {}\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("src/utils.rs"), "pub fn helper() {}\n").unwrap();
+    std::fs::write(
+        root.join("src/main.rs"),
+        "use demo_cli::run_lsblk;\n\nfn local_init() {}\n\nfn main() {\n    local_init();\n    run_lsblk();\n}\n",
+    )
+    .unwrap();
+
+    // Extract only `src/main.rs` without parsing `src/lib.rs` or `src/utils.rs`
+    let main_sfgn = sfgn_extract_code::extract_code_file_to_sfgn(&root, "src/main.rs")
+        .expect("extract single file src/main.rs");
+    let main_doc = sfgn_core::Document::parse(&main_sfgn).expect("valid sfgn");
+
+    assert!(main_sfgn.contains("\"kind\": \"code_file\""));
+    assert!(main_sfgn.contains("\"source_file\": \"src/main.rs\""));
+    assert!(main_sfgn.contains("\"fn main\":"));
+    assert!(main_sfgn.contains("\"fn local_init\":"));
+
+    let fn_main_slice = main_doc
+        .node_slice_by_path("\"fn main\"")
+        .unwrap()
+        .expect("fn main node");
+    // Intra-file call resolves to local node
+    assert!(fn_main_slice.contains("\"fn local_init\""));
+    // Cross-crate import call resolves to unhydrated flat portal
+    assert!(fn_main_slice.contains("<\"sfgn-codes/src:lib.rs.sfgn\">"));
+
+    // External `mod utils;` in `src/lib.rs` resolves to `sfgn-codes/src:utils.rs.sfgn`
+    let lib_sfgn = sfgn_extract_code::extract_code_file_to_sfgn(&root, "src/lib.rs")
+        .expect("extract single file src/lib.rs");
+    assert!(lib_sfgn.contains("<\"sfgn-codes/src:utils.rs.sfgn\">"));
+}

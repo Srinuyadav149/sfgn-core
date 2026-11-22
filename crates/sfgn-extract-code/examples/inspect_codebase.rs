@@ -1,48 +1,58 @@
 use std::env;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use sfgn_core::{Document, MermaidDirection, render_ascii_tree, render_mermaid_with_direction};
-use sfgn_extract_code::{CodeExtractOptions, CodeExtractor, extract_code_to_sfgn};
+use sfgn_core::{
+    Document, MermaidDirection, flat_code_artifact_rel, render_ascii_tree,
+    render_mermaid_with_direction,
+};
+use sfgn_extract_code::{CodeExtractOptions, CodeExtractor, extract_code_file_to_sfgn};
 
 fn main() {
-    let mut target = ".".to_owned();
+    let mut positionals: Vec<String> = Vec::new();
     let mut print_bodies = false;
 
     for arg in env::args().skip(1) {
         if arg == "--bodies" {
             print_bodies = true;
         } else {
-            target = arg;
+            positionals.push(arg);
         }
     }
 
-    let target_path = Path::new(&target);
+    let (workspace_root, rel_file) = resolve_workspace_and_file(&positionals);
 
-    // 1. Compile the full `code.sfgn` (including verbatim `"""rust` bodies) and validate via Pass 1 + 2
-    let full_code_sfgn = extract_code_to_sfgn(target_path).unwrap_or_else(|err| {
-        eprintln!("Failed to extract SFGN code graph: {}", err);
-        std::process::exit(1);
-    });
+    // 1. Lazily compile only the selected source file into its flat `sfgn-codes/<path>.sfgn` graph
+    let full_code_sfgn =
+        extract_code_file_to_sfgn(&workspace_root, &rel_file).unwrap_or_else(|err| {
+            eprintln!(
+                "Failed to extract SFGN code graph for '{}': {}",
+                rel_file.display(),
+                err
+            );
+            std::process::exit(1);
+        });
 
     let full_doc = Document::parse(&full_code_sfgn).unwrap_or_else(|err| {
-        eprintln!("Validation failed on generated code.sfgn: {}", err);
+        eprintln!("Validation failed on generated code_file .sfgn: {}", err);
         std::process::exit(1);
     });
 
-    let out_file = Path::new("target/workspace_code.sfgn");
+    let artifact_rel = flat_code_artifact_rel(&rel_file);
+    let out_file = Path::new("target").join(&artifact_rel);
     if let Some(parent) = out_file.parent() {
         let _ = fs::create_dir_all(parent);
     }
-    if fs::write(out_file, &full_code_sfgn).is_ok() {
+    if fs::write(&out_file, &full_code_sfgn).is_ok() {
         println!(
-            "Saved full code.sfgn (with verbatim code blocks) to: {}\n",
+            "Saved single-file code graph (with verbatim code blocks) to: {}\n",
             out_file.display()
         );
     }
 
     let total_child_edges: usize = full_doc.nodes().map(|n| n.children().count()).sum();
     let total_rel_edges: usize = full_doc.nodes().map(|n| n.relatives().count()).sum();
+    let total_portals: usize = full_doc.nodes().map(|n| n.external_portals().count()).sum();
 
     // 2. For terminal readability, omit `"""` code bodies unless `--bodies` is passed
     let display_sfgn = if print_bodies {
@@ -52,19 +62,21 @@ fn main() {
             include_bodies: false,
             ..CodeExtractOptions::default()
         })
-        .extract(target_path)
+        .extract_file(&workspace_root, &rel_file)
         .unwrap_or_else(|err| {
-            eprintln!("Failed to extract structural code.sfgn: {}", err);
+            eprintln!("Failed to extract structural code_file .sfgn: {}", err);
             std::process::exit(1);
         })
     };
 
     println!("============================================================");
     println!(
-        "1. GENERATED code.sfgn ({} nodes, {} > edges, {} >> call/type/import edges, {} bytes full)",
+        "1. GENERATED {} ({} nodes, {} > edges, {} >> local edges, {} portals, {} bytes full)",
+        artifact_rel.display(),
         full_doc.len(),
         total_child_edges,
         total_rel_edges,
+        total_portals,
         full_code_sfgn.len()
     );
     if !print_bodies {
@@ -74,7 +86,7 @@ fn main() {
     println!("{}", display_sfgn);
 
     println!("============================================================");
-    println!("2. VISUAL DUAL-TOPOLOGY AST & SYMBOL TREE (> containment, >> calls/types)");
+    println!("2. VISUAL DUAL-TOPOLOGY SYMBOL TREE (> containment, >> calls/portals)");
     println!("============================================================");
     println!("{}", render_ascii_tree(&full_doc));
 
@@ -85,4 +97,35 @@ fn main() {
         "{}",
         render_mermaid_with_direction(&full_doc, MermaidDirection::LeftRight)
     );
+}
+
+fn resolve_workspace_and_file(positionals: &[String]) -> (PathBuf, PathBuf) {
+    match positionals.len() {
+        0 => {
+            let root = PathBuf::from(".");
+            let default_file = if root.join("src/lib.rs").is_file() {
+                PathBuf::from("src/lib.rs")
+            } else {
+                PathBuf::from("src/main.rs")
+            };
+            (root, default_file)
+        }
+        1 => {
+            let arg = PathBuf::from(&positionals[0]);
+            if arg.is_file() {
+                (PathBuf::from("."), arg)
+            } else {
+                let default_file = if arg.join("src/lib.rs").is_file() {
+                    PathBuf::from("src/lib.rs")
+                } else {
+                    PathBuf::from("src/main.rs")
+                };
+                (arg, default_file)
+            }
+        }
+        _ => (
+            PathBuf::from(&positionals[0]),
+            PathBuf::from(&positionals[1]),
+        ),
+    }
 }

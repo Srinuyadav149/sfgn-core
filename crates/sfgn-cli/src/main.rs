@@ -1,11 +1,19 @@
 use std::env;
+use std::ffi::OsStr;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process;
 
-use sfgn_core::{Document, MermaidDirection, render_ascii_tree, render_mermaid_with_direction};
+use sfgn_core::{
+    CODE_GRAPH_DIR, DOC_GRAPH_DIR, Document, FS_GRAPH_FILE, FlatArtifactDomain, MermaidDirection,
+    classify_workspace_file, decode_flat_artifact_path, flat_code_artifact_rel,
+    flat_doc_artifact_rel, is_generated_sfgn_artifact, render_ascii_tree,
+    render_mermaid_with_direction,
+};
 use sfgn_extract_code::{CodeExtractOptions, CodeExtractor, patch_node_source};
-use sfgn_extract_docs::{DocsExtractOptions, DocsExtractor, compile_ebnf_to_gbnf};
+use sfgn_extract_docs::{
+    DocsExtractOptions, DocsExtractor, classify_media_extension, compile_ebnf_to_gbnf,
+};
 use sfgn_extract_fs::FsExtractor;
 
 const HELP_TEXT: &str = "\
@@ -15,17 +23,23 @@ USAGE:
     sfgn <COMMAND> [OPTIONS]
 
 COMMANDS:
-    compile <ROOT_DIR> [--out-dir <DIR>] [--no-bodies] [--public-only] [--no-media]
-        Compile a workspace into federated fs.sfgn, code.sfgn, and doc.sfgn graphs
-        (default output directory: <ROOT_DIR>/.sfgn).
+    compile <ROOT_DIR> [--out-dir <DIR>] [--eager-all] [--no-bodies] [--public-only] [--no-media]
+        Compile a workspace into eager fs.sfgn and flat sfgn-codes/ + sfgn-docs/
+        directories at the workspace root (default output directory: <ROOT_DIR>).
+        With --eager-all, pre-populates all per-file .sfgn graphs upfront.
+
+    hydrate <ROOT_DIR> <REL_PATH> [--force] [--print] [--no-bodies] [--public-only] [--no-media]
+        Lazily compile a single workspace file into sfgn-codes/<path>.sfgn or
+        sfgn-docs/<path>.sfgn (using ':' as path separator), skipping work if
+        the cached artifact is newer than the source file.
 
     check <FILE.sfgn>
         Validate an SFGN v1.0 file through Pass 1 (scanner) and Pass 2 (topology).
 
-    slice <FILE.sfgn> <NODE_PATH> [--follow-portals]
+    slice <FILE.sfgn> <NODE_PATH> [--follow-portals] [--root <WORKSPACE_ROOT>]
         Extract the exact zero-copy UTF-8 slice for <NODE_PATH> (e.g. \">:\",
-        \"src\">\"builder.rs\", \"struct SfgnBuilder\"). With --follow-portals,
-        also resolves and prints any linked <\"other.sfgn\">[SubPath] slices.
+        \"src\">\"builder.rs\", \"fn main\"). With --follow-portals, auto-hydrates
+        and prints any linked <\"sfgn-codes/...\">, <\"sfgn-docs/...\">, or <\"fs.sfgn\"> slices.
 
     grep <FILE.sfgn> <QUERY> [--case-sensitive]
         Zero-copy linear scan across node headers, properties, and multiline blocks.
@@ -36,11 +50,31 @@ COMMANDS:
 
     patch <WORKSPACE_ROOT> <CODE_SFGN> <NODE_PATH> (--body <CODE> | --body-file <FILE>)
         Splice an updated code payload back into the original source file on disk
-        using the node's \"source_file\" and \"line_span\" properties.
+        using the node's \"source_file\" and \"line_span\" properties, and refresh
+        the cached sfgn-codes/ graph.
 
     gbnf <INPUT.ebnf> [--out <OUTPUT.gbnf>]
         Transpile an EBNF grammar specification into a llama.cpp GBNF grammar.
 ";
+
+#[derive(Debug, Clone, Copy)]
+struct HydrateConfig {
+    include_bodies: bool,
+    include_private: bool,
+    include_media_proxies: bool,
+    force: bool,
+}
+
+impl Default for HydrateConfig {
+    fn default() -> Self {
+        Self {
+            include_bodies: true,
+            include_private: true,
+            include_media_proxies: true,
+            force: false,
+        }
+    }
+}
 
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -55,6 +89,7 @@ fn main() {
 
     let result = match args[0].as_str() {
         "compile" => cmd_compile(&args[1..]),
+        "hydrate" => cmd_hydrate(&args[1..]),
         "check" => cmd_check(&args[1..]),
         "slice" => cmd_slice(&args[1..]),
         "grep" => cmd_grep(&args[1..]),
@@ -76,9 +111,11 @@ fn main() {
 fn cmd_compile(args: &[String]) -> Result<(), String> {
     let mut root_dir: Option<PathBuf> = None;
     let mut out_dir: Option<PathBuf> = None;
-    let mut include_bodies = true;
-    let mut include_private = true;
-    let mut include_media_proxies = true;
+    let mut eager_all = false;
+    let mut cfg = HydrateConfig {
+        force: true,
+        ..HydrateConfig::default()
+    };
 
     let mut i = 0;
     while i < args.len() {
@@ -90,9 +127,10 @@ fn cmd_compile(args: &[String]) -> Result<(), String> {
                     .ok_or_else(|| "--out-dir requires a directory path".to_owned())?;
                 out_dir = Some(PathBuf::from(val));
             }
-            "--no-bodies" => include_bodies = false,
-            "--public-only" => include_private = false,
-            "--no-media" => include_media_proxies = false,
+            "--eager-all" => eager_all = true,
+            "--no-bodies" => cfg.include_bodies = false,
+            "--public-only" => cfg.include_private = false,
+            "--no-media" => cfg.include_media_proxies = false,
             flag if flag.starts_with('-') => {
                 return Err(format!("unknown option '{}' for `sfgn compile`", flag));
             }
@@ -107,7 +145,7 @@ fn cmd_compile(args: &[String]) -> Result<(), String> {
     }
 
     let root = root_dir.unwrap_or_else(|| PathBuf::from("."));
-    let target_dir = out_dir.unwrap_or_else(|| root.join(".sfgn"));
+    let target_dir = out_dir.unwrap_or_else(|| root.clone());
     fs::create_dir_all(&target_dir).map_err(|e| {
         format!(
             "failed to create output directory '{}': {}",
@@ -116,46 +154,130 @@ fn cmd_compile(args: &[String]) -> Result<(), String> {
         )
     })?;
 
-    // 1. fs.sfgn
+    let codes_dir = target_dir.join(CODE_GRAPH_DIR);
+    let docs_dir = target_dir.join(DOC_GRAPH_DIR);
+    fs::create_dir_all(&codes_dir).map_err(|e| {
+        format!(
+            "failed to create code graph directory '{}': {}",
+            codes_dir.display(),
+            e
+        )
+    })?;
+    fs::create_dir_all(&docs_dir).map_err(|e| {
+        format!(
+            "failed to create doc graph directory '{}': {}",
+            docs_dir.display(),
+            e
+        )
+    })?;
+
+    // 1. Eager root `fs.sfgn`
     let fs_sfgn = FsExtractor::default()
         .extract(&root)
         .map_err(|e| format!("fs extraction failed: {}", e))?;
-    let fs_path = target_dir.join("fs.sfgn");
+    let fs_path = target_dir.join(FS_GRAPH_FILE);
     fs::write(&fs_path, &fs_sfgn)
         .map_err(|e| format!("failed to write '{}': {}", fs_path.display(), e))?;
 
-    // 2. code.sfgn
-    let code_sfgn = CodeExtractor::new(CodeExtractOptions {
-        include_bodies,
-        include_private,
-        ..CodeExtractOptions::default()
-    })
-    .extract(&root)
-    .map_err(|e| format!("code extraction failed: {}", e))?;
-    let code_path = target_dir.join("code.sfgn");
-    fs::write(&code_path, &code_sfgn)
-        .map_err(|e| format!("failed to write '{}': {}", code_path.display(), e))?;
-
-    // 3. doc.sfgn (federated with fs.sfgn & code.sfgn portals)
-    let doc_sfgn = DocsExtractor::new(DocsExtractOptions {
-        include_media_proxies,
-        fs_portal_file: Some("fs.sfgn".to_owned()),
-        code_portal_file: Some("code.sfgn".to_owned()),
-        ..DocsExtractOptions::default()
-    })
-    .extract(&root)
-    .map_err(|e| format!("docs extraction failed: {}", e))?;
-    let doc_path = target_dir.join("doc.sfgn");
-    fs::write(&doc_path, &doc_sfgn)
-        .map_err(|e| format!("failed to write '{}': {}", doc_path.display(), e))?;
-
     println!(
-        "Compiled SFGN workspace graphs into {}:",
+        "Initialized SFGN workspace graphs in {}:",
         target_dir.display()
     );
-    print_graph_summary("fs.sfgn", &fs_sfgn)?;
-    print_graph_summary("code.sfgn", &code_sfgn)?;
-    print_graph_summary("doc.sfgn", &doc_sfgn)?;
+    print_graph_summary(FS_GRAPH_FILE, &fs_sfgn)?;
+
+    if eager_all {
+        let mut hydrated_codes = 0usize;
+        let mut hydrated_docs = 0usize;
+        let mut rel_files = Vec::new();
+        collect_workspace_rel_files(&root, &root, &mut rel_files)?;
+        rel_files.sort();
+
+        for rel_file in rel_files {
+            if let Some((artifact_abs, _)) =
+                ensure_hydrated_artifact(&root, &target_dir, &rel_file, cfg)?
+            {
+                if artifact_abs.starts_with(&codes_dir) {
+                    hydrated_codes += 1;
+                } else {
+                    hydrated_docs += 1;
+                }
+            }
+        }
+        println!(
+            "  {:<10} {} hydrated files in {}/",
+            "codes", hydrated_codes, CODE_GRAPH_DIR
+        );
+        println!(
+            "  {:<10} {} hydrated files in {}/",
+            "docs", hydrated_docs, DOC_GRAPH_DIR
+        );
+    } else {
+        println!(
+            "  {:<10} ready for lazy hydration ({}/ and {}/)",
+            "lazy", CODE_GRAPH_DIR, DOC_GRAPH_DIR
+        );
+    }
+
+    Ok(())
+}
+
+fn cmd_hydrate(args: &[String]) -> Result<(), String> {
+    let mut positionals: Vec<String> = Vec::new();
+    let mut print_slice = false;
+    let mut cfg = HydrateConfig::default();
+
+    for arg in args {
+        match arg.as_str() {
+            "--force" | "-f" => cfg.force = true,
+            "--print" => print_slice = true,
+            "--no-bodies" => cfg.include_bodies = false,
+            "--public-only" => cfg.include_private = false,
+            "--no-media" => cfg.include_media_proxies = false,
+            flag if flag.starts_with('-') => {
+                return Err(format!("unknown option '{}' for `sfgn hydrate`", flag));
+            }
+            val => positionals.push(val.to_owned()),
+        }
+    }
+
+    if positionals.len() != 2 {
+        return Err(
+            "usage: sfgn hydrate <ROOT_DIR> <REL_PATH> [--force] [--print] [--no-bodies] [--public-only] [--no-media]"
+                .to_owned(),
+        );
+    }
+
+    let root = Path::new(&positionals[0]);
+    let rel_path = Path::new(&positionals[1]);
+
+    let Some((artifact_abs, recompiled)) = ensure_hydrated_artifact(root, root, rel_path, cfg)?
+    else {
+        return Err(format!(
+            "file '{}' is tracked in {} only (not a code, Markdown, or media asset)",
+            rel_path.display(),
+            FS_GRAPH_FILE
+        ));
+    };
+
+    let raw = fs::read_to_string(&artifact_abs)
+        .map_err(|e| format!("failed to read '{}': {}", artifact_abs.display(), e))?;
+    let status = if recompiled { "Hydrated" } else { "Up-to-date" };
+    println!("{} {}:", status, artifact_abs.display());
+    print_graph_summary(
+        artifact_abs
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("artifact.sfgn"),
+        &raw,
+    )?;
+
+    if print_slice {
+        println!();
+        print!("{}", raw);
+        if !raw.ends_with('\n') {
+            println!();
+        }
+    }
 
     Ok(())
 }
@@ -208,11 +330,20 @@ fn cmd_check(args: &[String]) -> Result<(), String> {
 fn cmd_slice(args: &[String]) -> Result<(), String> {
     let mut file_path: Option<PathBuf> = None;
     let mut node_path: Option<String> = None;
+    let mut explicit_root: Option<PathBuf> = None;
     let mut follow_portals = false;
 
-    for arg in args {
-        match arg.as_str() {
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
             "--follow-portals" => follow_portals = true,
+            "--root" => {
+                i += 1;
+                let val = args
+                    .get(i)
+                    .ok_or_else(|| "--root requires a workspace directory path".to_owned())?;
+                explicit_root = Some(PathBuf::from(val));
+            }
             flag if flag.starts_with('-') => {
                 return Err(format!("unknown option '{}' for `sfgn slice`", flag));
             }
@@ -226,12 +357,17 @@ fn cmd_slice(args: &[String]) -> Result<(), String> {
                 }
             }
         }
+        i += 1;
     }
 
-    let path = file_path
-        .ok_or_else(|| "usage: sfgn slice <FILE.sfgn> <NODE_PATH> [--follow-portals]".to_owned())?;
-    let query_path = node_path
-        .ok_or_else(|| "usage: sfgn slice <FILE.sfgn> <NODE_PATH> [--follow-portals]".to_owned())?;
+    let path = file_path.ok_or_else(|| {
+        "usage: sfgn slice <FILE.sfgn> <NODE_PATH> [--follow-portals] [--root <WORKSPACE_ROOT>]"
+            .to_owned()
+    })?;
+    let query_path = node_path.ok_or_else(|| {
+        "usage: sfgn slice <FILE.sfgn> <NODE_PATH> [--follow-portals] [--root <WORKSPACE_ROOT>]"
+            .to_owned()
+    })?;
 
     let bytes =
         fs::read(&path).map_err(|e| format!("failed to read '{}': {}", path.display(), e))?;
@@ -249,9 +385,19 @@ fn cmd_slice(args: &[String]) -> Result<(), String> {
     }
 
     if follow_portals {
-        let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
+        let ws_root = explicit_root.unwrap_or_else(|| detect_workspace_root(&path));
         for portal in node.external_portals() {
-            let target_file = base_dir.join(portal.file_path);
+            // Auto-hydrate lazy flat portal targets (`sfgn-codes/...` or `sfgn-docs/...`) on demand
+            if let Some(rel_src) = decode_flat_artifact_path(portal.file_path) {
+                let _ = ensure_hydrated_artifact(
+                    &ws_root,
+                    &ws_root,
+                    &rel_src,
+                    HydrateConfig::default(),
+                )?;
+            }
+
+            let target_file = ws_root.join(portal.file_path);
             let Ok(target_bytes) = fs::read(&target_file) else {
                 eprintln!(
                     "warning: could not open portal target '{}'",
@@ -503,6 +649,28 @@ fn cmd_patch(args: &[String]) -> Result<(), String> {
     patch_node_source(workspace_root, node, &new_body)
         .map_err(|e| format!("patch failed: {}", e))?;
 
+    // Refresh the flat `sfgn-codes/<encoded>.sfgn` file so updated line_spans are immediately live
+    if code_sfgn_path.parent().and_then(|p| p.file_name()) == Some(OsStr::new(CODE_GRAPH_DIR)) {
+        if let Some(file_name) = code_sfgn_path.file_name().and_then(|n| n.to_str()) {
+            let artifact_rel = format!("{}/{}", CODE_GRAPH_DIR, file_name);
+            if let Some(rel_src) = decode_flat_artifact_path(&artifact_rel) {
+                let out_root = code_sfgn_path
+                    .parent()
+                    .and_then(|p| p.parent())
+                    .unwrap_or(workspace_root);
+                let _ = ensure_hydrated_artifact(
+                    workspace_root,
+                    out_root,
+                    &rel_src,
+                    HydrateConfig {
+                        force: true,
+                        ..HydrateConfig::default()
+                    },
+                )?;
+            }
+        }
+    }
+
     println!("Patched {} via {}", node_path, code_sfgn_path.display());
     Ok(())
 }
@@ -551,5 +719,151 @@ fn cmd_gbnf(args: &[String]) -> Result<(), String> {
         print!("{}", gbnf);
     }
 
+    Ok(())
+}
+
+// ============================================================================
+// Flat Workspace Root & Lazy Hydration Helpers
+// ============================================================================
+
+fn detect_workspace_root(sfgn_file: &Path) -> PathBuf {
+    let resolved = fs::canonicalize(sfgn_file).unwrap_or_else(|_| sfgn_file.to_path_buf());
+    let Some(parent) = resolved.parent() else {
+        return PathBuf::from(".");
+    };
+
+    if matches!(
+        parent.file_name().and_then(|n| n.to_str()),
+        Some(CODE_GRAPH_DIR | DOC_GRAPH_DIR)
+    ) {
+        if let Some(ws_root) = parent.parent() {
+            return ws_root.to_path_buf();
+        }
+    }
+
+    for ancestor in parent.ancestors() {
+        if ancestor.join(FS_GRAPH_FILE).is_file() {
+            return ancestor.to_path_buf();
+        }
+    }
+
+    parent.to_path_buf()
+}
+
+fn ensure_hydrated_artifact(
+    workspace_root: &Path,
+    out_root: &Path,
+    rel_source: &Path,
+    cfg: HydrateConfig,
+) -> Result<Option<(PathBuf, bool)>, String> {
+    let clean_rel = normalize_rel_path(rel_source)?;
+    let ext = clean_rel.extension().and_then(|e| e.to_str()).unwrap_or("");
+
+    let domain = match classify_workspace_file(&clean_rel) {
+        FlatArtifactDomain::Code => FlatArtifactDomain::Code,
+        FlatArtifactDomain::DocOrMedia => FlatArtifactDomain::DocOrMedia,
+        FlatArtifactDomain::FsOnly => {
+            if cfg.include_media_proxies && classify_media_extension(ext).is_some() {
+                FlatArtifactDomain::DocOrMedia
+            } else {
+                return Ok(None);
+            }
+        }
+    };
+
+    let artifact_rel = match domain {
+        FlatArtifactDomain::Code => flat_code_artifact_rel(&clean_rel),
+        FlatArtifactDomain::DocOrMedia => flat_doc_artifact_rel(&clean_rel),
+        FlatArtifactDomain::FsOnly => unreachable!(),
+    };
+
+    let abs_source = workspace_root.join(&clean_rel);
+    let abs_artifact = out_root.join(&artifact_rel);
+
+    if !cfg.force && abs_artifact.is_file() {
+        if let (Ok(src_meta), Ok(art_meta)) =
+            (fs::metadata(&abs_source), fs::metadata(&abs_artifact))
+        {
+            if let (Ok(src_mtime), Ok(art_mtime)) = (src_meta.modified(), art_meta.modified()) {
+                if art_mtime >= src_mtime {
+                    return Ok(Some((abs_artifact, false)));
+                }
+            }
+        }
+    }
+
+    let rendered = match domain {
+        FlatArtifactDomain::Code => CodeExtractor::new(CodeExtractOptions {
+            include_bodies: cfg.include_bodies,
+            include_private: cfg.include_private,
+            ..CodeExtractOptions::default()
+        })
+        .extract_file(workspace_root, &clean_rel)
+        .map_err(|e| format!("code hydration failed for '{}': {}", clean_rel.display(), e))?,
+        FlatArtifactDomain::DocOrMedia => DocsExtractor::new(DocsExtractOptions {
+            include_media_proxies: cfg.include_media_proxies,
+            ..DocsExtractOptions::default()
+        })
+        .extract_file(workspace_root, &clean_rel)
+        .map_err(|e| format!("doc hydration failed for '{}': {}", clean_rel.display(), e))?,
+        FlatArtifactDomain::FsOnly => unreachable!(),
+    };
+
+    if let Some(parent) = abs_artifact.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("failed to create directory '{}': {}", parent.display(), e))?;
+    }
+    fs::write(&abs_artifact, &rendered)
+        .map_err(|e| format!("failed to write '{}': {}", abs_artifact.display(), e))?;
+
+    Ok(Some((abs_artifact, true)))
+}
+
+fn normalize_rel_path(rel_path: &Path) -> Result<PathBuf, String> {
+    let mut clean = PathBuf::new();
+    for comp in rel_path.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::Normal(os) => clean.push(os),
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(format!(
+                    "path '{}' must be relative to the workspace root",
+                    rel_path.display()
+                ));
+            }
+        }
+    }
+    if clean.as_os_str().is_empty() {
+        return Err("source relative path cannot be empty".to_owned());
+    }
+    Ok(clean)
+}
+
+fn collect_workspace_rel_files(
+    root: &Path,
+    current: &Path,
+    out: &mut Vec<PathBuf>,
+) -> Result<(), String> {
+    let entries = fs::read_dir(current)
+        .map_err(|e| format!("failed to read directory '{}': {}", current.display(), e))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("directory entry error: {}", e))?;
+        let path = entry.path();
+        let file_name = entry.file_name();
+        if file_name == ".git" || file_name == "target" {
+            continue;
+        }
+        let Ok(rel) = path.strip_prefix(root) else {
+            continue;
+        };
+        if is_generated_sfgn_artifact(rel) {
+            continue;
+        }
+        if path.is_dir() {
+            collect_workspace_rel_files(root, &path, out)?;
+        } else if path.is_file() {
+            out.push(rel.to_path_buf());
+        }
+    }
     Ok(())
 }

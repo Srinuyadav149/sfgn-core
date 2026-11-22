@@ -1,6 +1,8 @@
 pub mod builder;
 pub mod document;
 pub mod emit;
+pub mod flat_path;
+pub use flat_path::*;
 pub mod error;
 pub mod lexer;
 pub mod scanner;
