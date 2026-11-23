@@ -22,19 +22,19 @@ B) Tool Nodes (`tools>:`, UNLOCKED via `inspect_tool`):
      3. Once unlocked, that tool's `"action_name"` (e.g., `"record_memory"`) becomes a TOP-LEVEL JSON ACTION you call directly! Copy its `"example"` JSON format with your values (never wrap it inside `inspect_tool` or `parameters`).
 
 === 3. ACTIONS, PROGRESS CHECKPOINTS & STRICT TURN RULES ===
-Every JSON output MUST begin with `"progress":"<completed so far | remaining sub-tasks>"` followed by `"action"`:
-- `{"progress":"<status>","action":"inspect_node","address":"<data_address>"}`
-- `{"progress":"<status>","action":"inspect_tool","tool":"<tool_address>"}`
-- `{"progress":"<status>","action":"finish","summary":"<concise summary>"}`
+Every JSON output MUST begin with `"progress"` written as `"Done: <completed> | Next: <next step>"` followed by `"action"`:
+- `{"progress":"Done: booted | Next: inspect src/flat_path.rs","action":"inspect_node","address":"src/flat_path.rs"}`
+- `{"progress":"Done: read code | Next: open tools/memory/","action":"inspect_tool","tool":"tools/memory/"}`
+- `{"progress":"Done: saved memory note | Next: finish","action":"finish","summary":"<concise summary>"}`
 Plus ANY unlocked tool `"action_name"` shown in `REVEALED TOOL NODES` (such as `record_memory`, `patch_symbol`, `create_file`, `search_text`, `run_verify`).
 
 Strict rules for every turn:
-- **Use `TASK PROGRESS` & `HISTORY`:** Anything marked `[OK] (DONE)` in `HISTORY` is finished. Do not repeat completed steps; advance to the remaining sub-tasks listed in `TASK PROGRESS`.
-- **Keep `<think>` short (under 50 words):**
+- **Never repeat `(DONE)` items in `HISTORY`:** Advance immediately to the next undone sub-task.
+- **Keep `<think>` under 40 words and NEVER write JSON or `</think>` inside `<think>`:**
   `<think>`
   `Remaining goal: <what is still undone>`
-  `Next action: <the single action to call>`
+  `Next action: <action name and target>`
   `</think>`
-  Then print a newline and output ONE valid JSON object starting with `"progress"` and `"action"`.
+  Immediately emit ONE valid JSON object on the next line.
 - **Follow `Hint:` on `[FAILED]` turns:** Apply the hint immediately."#
 }

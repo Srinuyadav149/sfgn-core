@@ -38,23 +38,13 @@ impl Scratchpad {
         self.visited_targets.insert(node.address.clone());
 
         if node.level == RevealLevel::Level2Leaf {
-            // Evict superseded Level 1 file outline (`src/foo.rs`) when inspecting `src/foo.rs::symbol`
             if let Some((parent_file, _)) = node.address.split_once("::") {
                 self.active_nodes.retain(|existing| {
                     !(existing.address == parent_file
                         && existing.level == RevealLevel::Level1Outline)
                 });
             }
-            // Evict superseded Level 1 tool branch (`tools/memory/`) when unlocking `tools/memory/leaf`
-            if node.address.starts_with("tools/")
-                && let Some((branch_prefix, _)) = node.address.rsplit_once('/')
-            {
-                let branch_addr = format!("{}/", branch_prefix);
-                self.active_nodes.retain(|existing| {
-                    !(existing.address == branch_addr
-                        && existing.level == RevealLevel::Level1Outline)
-                });
-            }
+            self.evict_tool_branch(&node.address);
         }
 
         if let Some(pos) = self
@@ -69,6 +59,19 @@ impl Scratchpad {
         }
         self.active_nodes.push_back(node);
         self.last_error_banner = None;
+    }
+
+    /// Evicts a superseded Level 1 tool branch (`tools/memory/`) once a leaf (`tools/memory/record_memory`) is unlocked.
+    pub fn evict_tool_branch(&mut self, leaf_address: &str) {
+        if leaf_address.starts_with("tools/") {
+            if let Some((branch_prefix, _)) = leaf_address.rsplit_once('/') {
+                let branch_addr = format!("{}/", branch_prefix);
+                self.active_nodes.retain(|existing| {
+                    !(existing.address == branch_addr
+                        && existing.level == RevealLevel::Level1Outline)
+                });
+            }
+        }
     }
 
     pub fn set_task_progress(&mut self, progress: impl Into<String>) {

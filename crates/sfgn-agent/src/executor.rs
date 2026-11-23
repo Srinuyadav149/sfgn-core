@@ -263,7 +263,8 @@ impl ActionDispatcher {
                     node.address
                 );
                 self.scratchpad.mark_target_visited(tool.trim());
-                self.scratchpad.push_node(node);
+                self.scratchpad.evict_tool_branch(&node.address);
+                self.scratchpad.clear_error_banner();
                 self.history.push_ok(turn, &action_summary, &obs);
                 DispatchStep::Ok {
                     action_summary,
@@ -810,10 +811,10 @@ fn optional_str<'a>(obj: &'a JsonValue, key: &str) -> Option<&'a str> {
 
 fn extract_json_object_slice(raw: &str) -> &str {
     let trimmed = raw.trim();
-    if let (Some(start), Some(end)) = (trimmed.find('{'), trimmed.rfind('}'))
-        && start <= end
-    {
-        return &trimmed[start..=end];
+    if let (Some(start), Some(end)) = (trimmed.find('{'), trimmed.rfind('}')) {
+        if start <= end {
+            return &trimmed[start..=end];
+        }
     }
     trimmed
 }

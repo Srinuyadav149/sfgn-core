@@ -92,7 +92,7 @@ impl ToolRegistry {
                 gbnf_rule_name: "list-dir",
                 gbnf_rule_body: r#"list-dir ::= "{\"progress\":" json-str ",\"action\":\"list_dir\",\"path\":" json-str "}""#,
                 instructions: "List files and subdirectories inside a workspace directory path (e.g. \"src\" or \".\").",
-                schema_template: r#"{"progress":"<done | remaining>","action":"list_dir","path":"<dir_path>"}"#,
+                schema_template: r#"{"progress":"<done | next>","action":"list_dir","path":"<dir_path>"}"#,
                 example_json: r#"{"progress":"Done: booted | Next: list src/","action":"list_dir","path":"src"}"#,
             },
             ToolSpec {
@@ -102,7 +102,7 @@ impl ToolRegistry {
                 gbnf_rule_name: "search-text",
                 gbnf_rule_body: r#"search-text ::= "{\"progress\":" json-str ",\"action\":\"search_text\",\"query\":" json-str ",\"path_prefix\":" opt-str "}""#,
                 instructions: "Search for a literal substring across workspace text files, optionally scoped to path_prefix (or null).",
-                schema_template: r#"{"progress":"<done | remaining>","action":"search_text","query":"<substring>","path_prefix":"<dir_or_null>"}"#,
+                schema_template: r#"{"progress":"<done | next>","action":"search_text","query":"<substring>","path_prefix":"<dir_or_null>"}"#,
                 example_json: r#"{"progress":"Done: unlocked search_text | Next: find encode_flat_rel_path","action":"search_text","query":"encode_flat_rel_path","path_prefix":"src"}"#,
             },
             ToolSpec {
@@ -112,7 +112,7 @@ impl ToolRegistry {
                 gbnf_rule_name: "create-file",
                 gbnf_rule_body: r#"create-file ::= "{\"progress\":" json-str ",\"action\":\"create_file\",\"path\":" json-str ",\"code\":" json-str "}""#,
                 instructions: "Create a new workspace file at path with full UTF-8 content and hydrate its SFGN graph.",
-                schema_template: r#"{"progress":"<done | remaining>","action":"create_file","path":"<rel_file_path>","code":"<file_content>"}"#,
+                schema_template: r#"{"progress":"<done | next>","action":"create_file","path":"<rel_file_path>","code":"<file_content>"}"#,
                 example_json: r#"{"progress":"Done: inspected module | Next: create helper.rs","action":"create_file","path":"src/helper.rs","code":"pub fn ping() -> bool { true }\n"}"#,
             },
             ToolSpec {
@@ -122,7 +122,7 @@ impl ToolRegistry {
                 gbnf_rule_name: "follow-ref",
                 gbnf_rule_body: r#"follow-ref ::= "{\"progress\":" json-str ",\"action\":\"follow_ref\",\"target_path\":" json-str ",\"target_symbol\":" opt-str "}""#,
                 instructions: "Jump directly along a >> relative or portal to inspect target_path (and optional target_symbol, or null).",
-                schema_template: r#"{"progress":"<done | remaining>","action":"follow_ref","target_path":"<rel_file_path>","target_symbol":"<symbol_or_null>"}"#,
+                schema_template: r#"{"progress":"<done | next>","action":"follow_ref","target_path":"<rel_file_path>","target_symbol":"<symbol_or_null>"}"#,
                 example_json: r#"{"progress":"Done: found portal | Next: inspect src/lib.rs","action":"follow_ref","target_path":"src/lib.rs","target_symbol":null}"#,
             },
             ToolSpec {
@@ -132,7 +132,7 @@ impl ToolRegistry {
                 gbnf_rule_name: "patch-symbol",
                 gbnf_rule_body: r#"patch-symbol ::= "{\"progress\":" json-str ",\"action\":\"patch_symbol\",\"path\":" json-str ",\"symbol\":" json-str ",\"code\":" json-str "}""#,
                 instructions: "Replace a function/struct/method implementation on disk. You MUST inspect the symbol's Level 2 payload first via inspect_node.",
-                schema_template: r#"{"progress":"<done | remaining>","action":"patch_symbol","path":"<rel_file_path>","symbol":"<symbol_name>","code":"<complete_replacement_code>"}"#,
+                schema_template: r#"{"progress":"<done | next>","action":"patch_symbol","path":"<rel_file_path>","symbol":"<symbol_name>","code":"<complete_replacement_code>"}"#,
                 example_json: r#"{"progress":"Done: read fn add | Next: patch fn add","action":"patch_symbol","path":"src/math.rs","symbol":"fn add","code":"pub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}"}"#,
             },
             ToolSpec {
@@ -142,7 +142,7 @@ impl ToolRegistry {
                 gbnf_rule_name: "search-docs",
                 gbnf_rule_body: r#"search-docs ::= "{\"progress\":" json-str ",\"action\":\"search_docs\",\"query\":" json-str "}""#,
                 instructions: "Search section headings and content across Markdown documentation files in the workspace.",
-                schema_template: r#"{"progress":"<done | remaining>","action":"search_docs","query":"<search_terms>"}"#,
+                schema_template: r#"{"progress":"<done | next>","action":"search_docs","query":"<search_terms>"}"#,
                 example_json: r#"{"progress":"Done: unlocked search_docs | Next: search lazy hydration","action":"search_docs","query":"lazy hydration"}"#,
             },
             ToolSpec {
@@ -152,7 +152,7 @@ impl ToolRegistry {
                 gbnf_rule_name: "recall-memory",
                 gbnf_rule_body: r#"recall-memory ::= "{\"progress\":" json-str ",\"action\":\"recall_memory\",\"query\":" json-str "}""#,
                 instructions: "Search persistent notes in sfgn-memories/ matching query.",
-                schema_template: r#"{"progress":"<done | remaining>","action":"recall_memory","query":"<keywords>"}"#,
+                schema_template: r#"{"progress":"<done | next>","action":"recall_memory","query":"<keywords>"}"#,
                 example_json: r#"{"progress":"Done: unlocked recall_memory | Next: check existing notes","action":"recall_memory","query":"flat_path"}"#,
             },
             ToolSpec {
@@ -162,7 +162,7 @@ impl ToolRegistry {
                 gbnf_rule_name: "record-memory",
                 gbnf_rule_body: r#"record-memory ::= "{\"progress\":" json-str ",\"action\":\"record_memory\",\"category\":" json-str ",\"entry_type\":" json-str ",\"note\":" json-str ",\"anchor_file\":" opt-str ",\"anchor_symbol\":" opt-str "}""#,
                 instructions: "Call {\"progress\":\"...\",\"action\":\"record_memory\", ...} directly to save a note in sfgn-memories/<category>.sfgn. Categories: architecture, invariants, bugs, notes. Entry types: summary, rule, insight.",
-                schema_template: r#"{"progress":"<done | remaining>","action":"record_memory","category":"<category>","entry_type":"<entry_type>","note":"<concise_note>","anchor_file":"<path_or_null>","anchor_symbol":"<symbol_or_null>"}"#,
+                schema_template: r#"{"progress":"<done | next>","action":"record_memory","category":"<category>","entry_type":"<entry_type>","note":"<concise_note>","anchor_file":"<path_or_null>","anchor_symbol":"<symbol_or_null>"}"#,
                 example_json: r#"{"progress":"Done: inspected encode_flat_rel_path | Next: save summary note","action":"record_memory","category":"notes","entry_type":"summary","note":"Encodes relative path components separated by colons.","anchor_file":"src/flat_path.rs","anchor_symbol":"fn encode_flat_rel_path"}"#,
             },
             ToolSpec {
@@ -172,7 +172,7 @@ impl ToolRegistry {
                 gbnf_rule_name: "run-verify",
                 gbnf_rule_body: r#"run-verify ::= "{\"progress\":" json-str ",\"action\":\"run_verify\"}""#,
                 instructions: "Run workspace verification (`cargo check --workspace`) to verify code edits compile cleanly.",
-                schema_template: r#"{"progress":"<done | remaining>","action":"run_verify"}"#,
+                schema_template: r#"{"progress":"<done | next>","action":"run_verify"}"#,
                 example_json: r#"{"progress":"Done: patched symbol | Next: verify build","action":"run_verify"}"#,
             },
         ];
@@ -303,9 +303,7 @@ impl ToolRegistry {
 
         let mut gbnf = String::with_capacity(1280);
         gbnf.push_str("root ::= think-block action\n");
-        gbnf.push_str(
-            "think-block ::= \"<think>\" ([^<] | \"<\" [^/])* \"</think>\" [ \\t\\r\\n]+\n",
-        );
+        gbnf.push_str("think-block ::= \"<think>\" ([^<] | \"<\" [^/])* \"</think>\\n\"\n");
         gbnf.push_str(&compiled_action_rule);
         gbnf.push('\n');
         gbnf.push_str(

@@ -58,7 +58,7 @@ impl ChatMessage {
     }
 }
 
-/// Configuration for the `/v1/chat/completions` endpoint, tuned by default for LFM3 1.7B.
+/// Configuration for the `/v1/chat/completions` endpoint.
 #[derive(Debug, Clone)]
 pub struct LlmConfig {
     /// Full HTTP endpoint URL (e.g. `http://127.0.0.1:9931/v1/chat/completions`).
@@ -67,9 +67,9 @@ pub struct LlmConfig {
     pub model: Option<String>,
     /// Sampling temperature (`0.0` for deterministic tool/graph traversal).
     pub temperature: f32,
-    /// Repetition penalty (`1.12` prevents `<think>` reasoning loops on LFM3 1.7B).
+    /// Repetition penalty (`1.12` prevents token loops on small local models).
     pub repeat_penalty: f32,
-    /// Maximum completion tokens (`1600` gives ample room for `<think>` + JSON without runaway loops).
+    /// Maximum completion tokens (`3072` gives LFM3 full `<think>` + JSON headroom inside `-c 8192`).
     pub max_tokens: u32,
     /// Enable `llama-server` KV-cache prefix reuse (`cache_prompt: true`).
     pub cache_prompt: bool,
@@ -88,7 +88,7 @@ impl Default for LlmConfig {
             model: None,
             temperature: 0.0,
             repeat_penalty: 1.12,
-            max_tokens: 1600,
+            max_tokens: 3072,
             cache_prompt: true,
             use_grammar: true,
             connect_timeout: Duration::from_secs(10),
