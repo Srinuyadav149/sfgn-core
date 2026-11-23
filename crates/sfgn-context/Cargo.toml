@@ -1,0 +1,13 @@
+[package]
+name = "sfgn-context"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.100"
+description = "SFGN graph projection, progressive reveal, unified tools>: registry, memory store, and KV-cache prompt assembler"
+
+[dependencies]
+sfgn-core = { path = "../.." }
+sfgn-extract-fs = { path = "../sfgn-extract-fs" }
+sfgn-extract-code = { path = "../sfgn-extract-code" }
+sfgn-extract-docs = { path = "../sfgn-extract-docs" }
+sfgn-llm = { path = "../sfgn-llm" }

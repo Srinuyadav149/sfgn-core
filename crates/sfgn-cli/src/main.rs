@@ -1,9 +1,13 @@
 use std::env;
 use std::ffi::OsStr;
 use std::fs;
+use std::io::{self, BufRead, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process;
 
+use sfgn_agent::{AgentConfig, AgentEvent, AgentRunner, AgentSession};
+use sfgn_context::logging::LOGS_GRAPH_DIR;
+use sfgn_context::memory::MEMORY_GRAPH_DIR;
 use sfgn_core::{
     CODE_GRAPH_DIR, DOC_GRAPH_DIR, Document, FS_GRAPH_FILE, FlatArtifactDomain, MermaidDirection,
     classify_workspace_file, decode_flat_artifact_path, flat_code_artifact_rel,
@@ -15,14 +19,25 @@ use sfgn_extract_docs::{
     DocsExtractOptions, DocsExtractor, classify_media_extension, compile_ebnf_to_gbnf,
 };
 use sfgn_extract_fs::FsExtractor;
+use sfgn_llm::LlmConfig;
 
 const HELP_TEXT: &str = "\
-sfgn - Simple Flat Graph Notation (SFGN v1.0) workspace compiler & tape inspector
+sfgn - Simple Flat Graph Notation (SFGN v1.0) workspace compiler, tape inspector & agent CLI
 
 USAGE:
     sfgn <COMMAND> [OPTIONS]
 
-COMMANDS:
+AGENT COMMANDS:
+    run <GOAL> [--root <DIR>] [--url <ENDPOINT>] [--model <NAME>] [--no-grammar] [--no-think]
+               [--max-turns <N>] [--max-errors <N>] [--max-tokens <N>] [--verify-cmd <CMD>]
+        Execute a single goal autonomously using progressive SFGN graph reveal and
+        bounded error-to-history retries (defaults to local LFM3 1.7B at 127.0.0.1:9931).
+
+    chat [--root <DIR>] [--url <ENDPOINT>] [--model <NAME>] [--no-grammar] [--no-think]
+         [--max-turns <N>] [--max-errors <N>] [--max-tokens <N>] [--verify-cmd <CMD>]
+        Start an interactive multi-goal REPL sharing memories, unlocked tools, and turn history.
+
+GRAPH & TAPE COMMANDS:
     compile <ROOT_DIR> [--out-dir <DIR>] [--eager-all] [--no-bodies] [--public-only] [--no-media]
         Compile a workspace into eager fs.sfgn and flat sfgn-codes/ + sfgn-docs/
         directories at the workspace root (default output directory: <ROOT_DIR>).
@@ -76,6 +91,27 @@ impl Default for HydrateConfig {
     }
 }
 
+#[derive(Debug, Clone)]
+struct AgentCliOptions {
+    root_dir: PathBuf,
+    llm_config: LlmConfig,
+    agent_config: AgentConfig,
+    show_thinking: bool,
+    goal: Option<String>,
+}
+
+impl Default for AgentCliOptions {
+    fn default() -> Self {
+        Self {
+            root_dir: PathBuf::from("."),
+            llm_config: LlmConfig::default(),
+            agent_config: AgentConfig::default(),
+            show_thinking: true,
+            goal: None,
+        }
+    }
+}
+
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
     if args.is_empty() || matches!(args[0].as_str(), "-h" | "--help" | "help") {
@@ -88,6 +124,8 @@ fn main() {
     }
 
     let result = match args[0].as_str() {
+        "run" => cmd_run(&args[1..]),
+        "chat" => cmd_chat(&args[1..]),
         "compile" => cmd_compile(&args[1..]),
         "hydrate" => cmd_hydrate(&args[1..]),
         "check" => cmd_check(&args[1..]),
@@ -107,6 +145,321 @@ fn main() {
         process::exit(1);
     }
 }
+
+// ============================================================================
+// Agent Commands (`sfgn run` & `sfgn chat`)
+// ============================================================================
+
+fn parse_agent_cli_options(args: &[String], require_goal: bool) -> Result<AgentCliOptions, String> {
+    let mut opts = AgentCliOptions::default();
+    let mut goal_parts: Vec<String> = Vec::new();
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--root" | "-r" => {
+                i += 1;
+                let val = args
+                    .get(i)
+                    .ok_or_else(|| "--root requires a workspace directory path".to_owned())?;
+                opts.root_dir = PathBuf::from(val);
+            }
+            "--url" => {
+                i += 1;
+                let val = args
+                    .get(i)
+                    .ok_or_else(|| "--url requires an HTTP endpoint URL".to_owned())?;
+                opts.llm_config.endpoint_url = val.clone();
+            }
+            "--model" | "-m" => {
+                i += 1;
+                let val = args
+                    .get(i)
+                    .ok_or_else(|| "--model requires a model identifier".to_owned())?;
+                opts.llm_config.model = Some(val.clone());
+            }
+            "--no-grammar" => {
+                opts.llm_config.use_grammar = false;
+            }
+            "--no-think" => {
+                opts.show_thinking = false;
+            }
+            "--max-turns" => {
+                i += 1;
+                let val = args
+                    .get(i)
+                    .ok_or_else(|| "--max-turns requires a positive integer".to_owned())?;
+                let parsed = val
+                    .parse::<usize>()
+                    .map_err(|_| format!("invalid --max-turns value '{}'", val))?;
+                if parsed == 0 {
+                    return Err("--max-turns must be >= 1".to_owned());
+                }
+                opts.agent_config.max_turns = parsed;
+            }
+            "--max-errors" => {
+                i += 1;
+                let val = args
+                    .get(i)
+                    .ok_or_else(|| "--max-errors requires a positive integer".to_owned())?;
+                let parsed = val
+                    .parse::<usize>()
+                    .map_err(|_| format!("invalid --max-errors value '{}'", val))?;
+                if parsed == 0 {
+                    return Err("--max-errors must be >= 1".to_owned());
+                }
+                opts.agent_config.max_consecutive_errors = parsed;
+            }
+            "--max-tokens" => {
+                i += 1;
+                let val = args
+                    .get(i)
+                    .ok_or_else(|| "--max-tokens requires a positive integer".to_owned())?;
+                let parsed = val
+                    .parse::<u32>()
+                    .map_err(|_| format!("invalid --max-tokens value '{}'", val))?;
+                if parsed == 0 {
+                    return Err("--max-tokens must be >= 1".to_owned());
+                }
+                opts.llm_config.max_tokens = parsed;
+            }
+            "--verify-cmd" => {
+                i += 1;
+                let val = args
+                    .get(i)
+                    .ok_or_else(|| "--verify-cmd requires a command string".to_owned())?;
+                let parts: Vec<String> = val.split_whitespace().map(ToOwned::to_owned).collect();
+                if parts.is_empty() {
+                    return Err("--verify-cmd cannot be empty".to_owned());
+                }
+                opts.agent_config.verify_command = parts;
+            }
+            flag if flag.starts_with('-') => {
+                return Err(format!("unknown option '{}' for agent command", flag));
+            }
+            positional => {
+                goal_parts.push(positional.to_owned());
+            }
+        }
+        i += 1;
+    }
+
+    if !goal_parts.is_empty() {
+        opts.goal = Some(goal_parts.join(" "));
+    } else if require_goal {
+        return Err(
+            "usage: sfgn run <GOAL> [--root <DIR>] [--url <ENDPOINT>] [--no-grammar] [--no-think]"
+                .to_owned(),
+        );
+    }
+
+    Ok(opts)
+}
+
+fn cmd_run(args: &[String]) -> Result<(), String> {
+    let opts = parse_agent_cli_options(args, true)?;
+    let goal = opts.goal.as_deref().unwrap_or_default();
+
+    println!(
+        "SFGN-Agent running in '{}' (endpoint={}, grammar={})",
+        opts.root_dir.display(),
+        opts.llm_config.endpoint_url,
+        opts.llm_config.use_grammar
+    );
+    println!("Goal: {}\n", goal);
+
+    let runner = AgentRunner::new(opts.llm_config, opts.agent_config);
+    let mut printer = CliStreamPrinter::new(opts.show_thinking);
+
+    let outcome = runner
+        .run(&opts.root_dir, goal, |ev| printer.on_event(ev))
+        .map_err(|e| e.to_string())?;
+
+    println!("\n=== SUMMARY ===");
+    println!("{}", outcome.summary);
+    println!(
+        "[session] turns={} | prompt_tokens={} (cached={}) | completion_tokens={} | log={}",
+        outcome.turns_used,
+        outcome.total_prompt_tokens,
+        outcome.total_cached_tokens,
+        outcome.total_completion_tokens,
+        outcome.log_path.display()
+    );
+
+    Ok(())
+}
+
+fn cmd_chat(args: &[String]) -> Result<(), String> {
+    let opts = parse_agent_cli_options(args, false)?;
+    let mut session = AgentSession::new(
+        &opts.root_dir,
+        opts.llm_config.clone(),
+        opts.agent_config.clone(),
+        "interactive-chat",
+    )
+    .map_err(|e| e.to_string())?;
+
+    println!(
+        "SFGN-Agent interactive chat in '{}' (endpoint={}, grammar={})",
+        opts.root_dir.display(),
+        opts.llm_config.endpoint_url,
+        opts.llm_config.use_grammar
+    );
+    println!("Enter a goal at the prompt, or type `/exit` to quit.\n");
+
+    let mut printer = CliStreamPrinter::new(opts.show_thinking);
+
+    if let Some(initial) = &opts.goal {
+        println!("> {}", initial);
+        match session.run_goal(initial, |ev| printer.on_event(ev)) {
+            Ok(outcome) => {
+                println!("\n=== SUMMARY ===");
+                println!("{}\n", outcome.summary);
+            }
+            Err(err) => {
+                eprintln!("\n[goal aborted] {}\n", err);
+            }
+        }
+    }
+
+    let stdin = io::stdin();
+    let mut line = String::new();
+    loop {
+        print!("sfgn> ");
+        let _ = io::stdout().flush();
+        line.clear();
+        let n = stdin
+            .lock()
+            .read_line(&mut line)
+            .map_err(|e| format!("failed to read stdin: {}", e))?;
+        if n == 0 {
+            break;
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if matches!(trimmed, "/exit" | "/quit" | "exit" | "quit") {
+            break;
+        }
+
+        match session.run_goal(trimmed, |ev| printer.on_event(ev)) {
+            Ok(outcome) => {
+                println!("\n=== SUMMARY ===");
+                println!(
+                    "{}\n[tokens] prompt={} (cached={}) | completion={} | log={}\n",
+                    outcome.summary,
+                    outcome.total_prompt_tokens,
+                    outcome.total_cached_tokens,
+                    outcome.total_completion_tokens,
+                    outcome.log_path.display()
+                );
+            }
+            Err(err) => {
+                eprintln!("\n[goal aborted] {}\n", err);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActiveStreamChannel {
+    None,
+    Thinking,
+    Content,
+}
+
+struct CliStreamPrinter {
+    show_thinking: bool,
+    channel: ActiveStreamChannel,
+}
+
+impl CliStreamPrinter {
+    fn new(show_thinking: bool) -> Self {
+        Self {
+            show_thinking,
+            channel: ActiveStreamChannel::None,
+        }
+    }
+
+    fn on_event(&mut self, event: AgentEvent<'_>) {
+        match event {
+            AgentEvent::TurnStarted { turn } => {
+                self.channel = ActiveStreamChannel::None;
+                println!("--- Turn {} ---", turn);
+            }
+            AgentEvent::ThinkingDelta(tok) => {
+                if self.show_thinking {
+                    if self.channel != ActiveStreamChannel::Thinking {
+                        print!("[think] ");
+                        self.channel = ActiveStreamChannel::Thinking;
+                    }
+                    print!("{}", tok);
+                    let _ = io::stdout().flush();
+                }
+            }
+            AgentEvent::ContentDelta(tok) => {
+                if self.channel != ActiveStreamChannel::Content {
+                    if self.channel == ActiveStreamChannel::Thinking {
+                        println!();
+                    }
+                    print!("[action] ");
+                    self.channel = ActiveStreamChannel::Content;
+                }
+                print!("{}", tok);
+                let _ = io::stdout().flush();
+            }
+            AgentEvent::TurnStats(resp) => {
+                if self.channel != ActiveStreamChannel::None {
+                    println!();
+                    self.channel = ActiveStreamChannel::None;
+                }
+                let gen_secs = resp
+                    .elapsed
+                    .saturating_sub(resp.ttft)
+                    .as_secs_f64()
+                    .max(0.001);
+                let tps = resp.usage.completion_tokens as f64 / gen_secs;
+                println!(
+                    "[stats] elapsed={:.1}s | ttft={:.1}s | prompt={} (cached={}) | completion={} (~{:.1} tok/s)",
+                    resp.elapsed.as_secs_f64(),
+                    resp.ttft.as_secs_f64(),
+                    resp.usage.prompt_tokens,
+                    resp.usage.cached_tokens,
+                    resp.usage.completion_tokens,
+                    tps
+                );
+            }
+            AgentEvent::ActionOk {
+                turn,
+                action,
+                observation,
+            } => {
+                println!("[T{} OK] {} -> {}", turn, action, observation);
+            }
+            AgentEvent::ActionFailed {
+                turn,
+                action,
+                error,
+                hint,
+            } => {
+                println!("[T{} FAILED] {} -> {}", turn, action, error);
+                if let Some(h) = hint {
+                    println!("  Hint: {}", h);
+                }
+            }
+            AgentEvent::Finished { turn, .. } => {
+                println!("[T{} FINISHED]", turn);
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Existing SFGN Graph & Tape Commands
+// ============================================================================
 
 fn cmd_compile(args: &[String]) -> Result<(), String> {
     let mut root_dir: Option<PathBuf> = None;
@@ -387,7 +740,6 @@ fn cmd_slice(args: &[String]) -> Result<(), String> {
     if follow_portals {
         let ws_root = explicit_root.unwrap_or_else(|| detect_workspace_root(&path));
         for portal in node.external_portals() {
-            // Auto-hydrate lazy flat portal targets (`sfgn-codes/...` or `sfgn-docs/...`) on demand
             if let Some(rel_src) = decode_flat_artifact_path(portal.file_path) {
                 let _ = ensure_hydrated_artifact(
                     &ws_root,
@@ -649,7 +1001,6 @@ fn cmd_patch(args: &[String]) -> Result<(), String> {
     patch_node_source(workspace_root, node, &new_body)
         .map_err(|e| format!("patch failed: {}", e))?;
 
-    // Refresh the flat `sfgn-codes/<encoded>.sfgn` file so updated line_spans are immediately live
     if code_sfgn_path.parent().and_then(|p| p.file_name()) == Some(OsStr::new(CODE_GRAPH_DIR)) {
         if let Some(file_name) = code_sfgn_path.file_name().and_then(|n| n.to_str()) {
             let artifact_rel = format!("{}/{}", CODE_GRAPH_DIR, file_name);
@@ -850,7 +1201,11 @@ fn collect_workspace_rel_files(
         let entry = entry.map_err(|e| format!("directory entry error: {}", e))?;
         let path = entry.path();
         let file_name = entry.file_name();
-        if file_name == ".git" || file_name == "target" {
+        if file_name == ".git"
+            || file_name == "target"
+            || file_name == MEMORY_GRAPH_DIR
+            || file_name == LOGS_GRAPH_DIR
+        {
             continue;
         }
         let Ok(rel) = path.strip_prefix(root) else {

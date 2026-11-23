@@ -1,0 +1,46 @@
+>:
+  "kind": "filesystem"
+  "root_name": "sfgn-cli"
+  "total_dirs": 2
+  "total_files": 3
+  "git_head": "5208437"
+  > ["Cargo.toml", "src", "tests"]
+
+"Cargo.toml":
+  "kind": "file"
+  "path": "Cargo.toml"
+  "size_bytes": 562
+  "lines": 19
+  "ext": "toml"
+  "git_status": "modified"
+  "last_commit": "e409f2a"
+
+"src":
+  "kind": "directory"
+  "path": "src"
+  > "main.rs"
+
+"main.rs":
+  "kind": "file"
+  "path": "src/main.rs"
+  "size_bytes": 42142
+  "lines": 1224
+  "ext": "rs"
+  "git_status": "modified"
+  "last_commit": "f449841"
+  >> ["cli_workflow.rs", <"sfgn-codes/src:main.rs.sfgn">]
+
+"tests":
+  "kind": "directory"
+  "path": "tests"
+  > "cli_workflow.rs"
+
+"cli_workflow.rs":
+  "kind": "file"
+  "path": "tests/cli_workflow.rs"
+  "size_bytes": 6364
+  "lines": 191
+  "ext": "rs"
+  "git_status": "clean"
+  "last_commit": "f449841"
+  >> ["main.rs", <"sfgn-codes/tests:cli_workflow.rs.sfgn">]

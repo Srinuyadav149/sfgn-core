@@ -1,0 +1,8 @@
+[package]
+name = "sfgn-llm"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.100"
+description = "Streaming /v1/chat/completions SSE client, GBNF grammar transport, and think/action demuxer for SFGN agents"
+
+[dependencies]

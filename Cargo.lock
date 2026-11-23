@@ -1520,13 +1520,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "sfgn-agent"
+version = "0.1.0"
+dependencies = [
+ "sfgn-context",
+ "sfgn-core",
+ "sfgn-llm",
+]
+
+[[package]]
 name = "sfgn-cli"
+version = "0.1.0"
+dependencies = [
+ "sfgn-agent",
+ "sfgn-context",
+ "sfgn-core",
+ "sfgn-extract-code",
+ "sfgn-extract-docs",
+ "sfgn-extract-fs",
+ "sfgn-llm",
+]
+
+[[package]]
+name = "sfgn-context"
 version = "0.1.0"
 dependencies = [
  "sfgn-core",
  "sfgn-extract-code",
  "sfgn-extract-docs",
  "sfgn-extract-fs",
+ "sfgn-llm",
 ]
 
 [[package]]
@@ -1562,6 +1585,10 @@ dependencies = [
  "ignore",
  "sfgn-core",
 ]
+
+[[package]]
+name = "sfgn-llm"
+version = "0.1.0"
 
 [[package]]
 name = "sha1dc"

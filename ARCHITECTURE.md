@@ -62,16 +62,21 @@ Document<'a>::node_slice_by_path(path) ──► &src[byte_range.start..byte_ran
 
 ## 3. Lazy Flat Workspace Graph Layout (`src/flat_path.rs`)
 
-Instead of compiling monolithic `code.sfgn` and `doc.sfgn` files upfront, workspaces materialize a lightweight eager root filesystem graph paired with flat, lazily hydrated per-file graphs:
+Instead of compiling monolithic `code.sfgn` and `doc.sfgn` files upfront, workspaces materialize a lightweight eager root filesystem graph paired with flat, lazily hydrated per-file graphs and agent state stores:
 
 ```text
 <workspace_root>/
 ├── fs.sfgn                             # Eagerly compiled at session start
 ├── sfgn-codes/                         # Flat directory of lazily hydrated code graphs
 │   └── crates:sfgn-cli:src:main.rs.sfgn
-└── sfgn-docs/                          # Flat directory of lazily hydrated doc & media graphs
-    ├── README.md.sfgn
-    └── resources:banner.svg.sfgn
+├── sfgn-docs/                          # Flat directory of lazily hydrated doc & media graphs
+│   ├── README.md.sfgn
+│   └── resources:banner.svg.sfgn
+├── sfgn-memories/                      # Persistent cross-session notes & anchor portals
+│   ├── index.sfgn
+│   └── architecture.sfgn
+└── sfgn-logs/                          # Turn-by-turn agent audit traces & token metrics
+    └── session-<timestamp>.sfgn
 ```
 
 ### Design Invariants
@@ -79,10 +84,10 @@ Instead of compiling monolithic `code.sfgn` and `doc.sfgn` files upfront, worksp
    - `encode_flat_rel_path` maps `/` and `\` to `:` (`src/main.rs` -> `src:main.rs`), avoiding collisions with `__` in filenames such as `__init__.py`.
    - `decode_flat_artifact_path` recovers the workspace-relative source `PathBuf` directly from `sfgn-codes/<stem>.sfgn` or `sfgn-docs/<stem>.sfgn`, while every hydrated file also stores `"source_file"` in its `>:` root block.
 2. **Self-Indexing Exclusion**:
-   - `is_generated_sfgn_artifact` skips `fs.sfgn`, `sfgn-codes/`, and `sfgn-docs/` in all directory walkers and Git history scans so generated graph caches never pollute workspace topology.
+   - `is_generated_sfgn_artifact` skips `fs.sfgn`, `sfgn-codes/`, and `sfgn-docs/` (and agent walkers additionally skip `sfgn-memories/` and `sfgn-logs/`) so generated graph caches and session logs never pollute workspace topology.
 3. **Incremental `mtime` Cache & Patch Coherence**:
    - `sfgn hydrate` and `sfgn slice --follow-portals` check `artifact_mtime >= source_mtime` before invoking `tree-sitter` or CommonMark parsing.
-   - `sfgn patch` splices updated symbol code onto disk via `"source_file"` and `"line_span"` (`crates/sfgn-extract-code/src/patch.rs`) and immediately re-hydrates that single file's `sfgn-codes/<encoded>.sfgn` artifact.
+   - `sfgn patch` and the agent's `patch_symbol` tool splice updated symbol code onto disk via `"source_file"` and `"line_span"` (`crates/sfgn-extract-code/src/patch.rs`) and immediately re-hydrate that single file's `sfgn-codes/<encoded>.sfgn` artifact.
 
 ---
 
@@ -105,9 +110,32 @@ Instead of compiling monolithic `code.sfgn` and `doc.sfgn` files upfront, worksp
 
 ---
 
-## 5. Agent Harness Boundary
+## 5. Agent Harness & Orchestration Architecture
 
-SFGN serves as the internal indexing, slicing, and patch-anchoring substrate rather than raw prompt syntax for small quantized models:
+SFGN acts as both the internal indexing/patching substrate and a unified lazy graph projection engineered to run deterministically on small local models (benchmarked on **LFM3 1.7B** via `llama-server`) as well as larger `/v1/chat/completions` backends:
 
-- **Internal Storage Layer**: The execution harness manages `fs.sfgn`, `sfgn-codes/`, and `sfgn-docs/`, performing `O(1)` node slices, portal traversals, `mtime` checks, and `line_span` disk patches.
-- **Projected Model Interface**: The harness strips SFGN delimiters and projects clean, token-minimal views—real repository paths (`src/flat_path.rs`), `[start, end]` line spans, signatures, caller/callee paths, and raw Rust or Markdown payloads—constrained by GBNF action grammars.
+```text
+PromptAssembler (`sfgn-context`)
+  │  Static System Prefix (SFGN ontology, address rules, 3 boot primitives)
+  │  + KV-Ordered User Prompt (Goal -> Level 0 Roots -> Revealed Tools -> History -> Active Nodes)
+  │  + Dynamic GBNF Grammar (`ToolRegistry::compile_gbnf`)
+  ▼
+LlmClient (`sfgn-llm`)
+  │  Zero-dependency HTTP/1.1 SSE client (`cache_prompt: true`, `repeat_penalty: 1.12`)
+  │  + StreamDemuxer (splits `reasoning_content` / `<think>` from final JSON action)
+  ▼
+ActionDispatcher & RecoveryPlanner (`sfgn-agent`)
+  ├── Core Primitives: `inspect_node`, `inspect_tool`, `finish`
+  ├── Unlocked Tools: `tools/fs/*`, `tools/code/*`, `tools/docs/*`, `tools/memory/*`, `tools/verify/*`
+  └── Error-to-History Loop: maps lookup, schema, duplicate, & `cargo` errors into `[FAILED] + Hint:`
+```
+
+### Crate Responsibilities
+- **`sfgn-llm` (`crates/sfgn-llm`)**: Pure `std` HTTP/1.1 chunked/SSE `/v1/chat/completions` client (`LlmClient`), RFC 8259 JSON parser/serializer, and `StreamDemuxer` separating `reasoning_content` / `<think>...</think>` blocks from the single-line JSON action.
+- **`sfgn-context` (`crates/sfgn-context`)**:
+  - **Progressive Reveal (`node.rs`, `knowledge.rs`)**: Projects workspace directories (`Level 0`), file/document outlines (`Level 1`), and symbol/section payloads (`Level 2`) using unambiguous address syntax (`dir/` for folders, `dir/file.ext` for files, `file::symbol` for symbols/sections, and `tools/branch/name` for leaf tools), with prefix-tolerant symbol resolution (`encode_flat_rel_path` and `fn encode_flat_rel_path` resolve identically).
+  - **Unified `tools>:` Registry (`tool_schema.rs`)**: Treats tools as SFGN nodes under `tools>:`. Inspecting a leaf tool reveals its `instructions`, `<placeholder>` `schema`, and concrete `example`, and dynamically unlocks its production rule in the compiled GBNF grammar.
+  - **Persistent Memory & Session Logs (`memory.rs`, `logging.rs`)**: Stores categorized cross-session notes in `sfgn-memories/<category>.sfgn` linked via `>>` portals to anchored source files, and writes turn-by-turn token/action traces to `sfgn-logs/session-<ts>.sfgn`.
+  - **KV-Cache Prefix Ordering (`assembler.rs`)**: Keeps the `system` prompt 100% static across turns and orders `user` sections from least volatile (`Goal`, `LEVEL 0 ROOTS`, `REVEALED TOOL NODES`) to most volatile (`HISTORY`, `ACTIVE SFGN NODES`) to maximize `llama-server` prompt-cache reuse.
+- **`sfgn-agent` (`crates/sfgn-agent`)**: Runs the unified `Assemble -> Stream -> Parse/Dispatch -> Record -> Retry` loop (`AgentRunner` and stateful `AgentSession`), enforcing a read-before-patch invariant and converting missing nodes/symbols, locked tools, duplicate calls, and `cargo check` diagnostics into structured `[FAILED]` + `Hint:` history entries with a bounded consecutive-error circuit breaker.
+- **`sfgn-cli` (`crates/sfgn-cli`)**: Exposes `sfgn run "<goal>"` and `sfgn chat` alongside the 8 core SFGN graph commands (`compile`, `hydrate`, `check`, `slice`, `grep`, `viz`, `patch`, `gbnf`).

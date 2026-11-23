@@ -2,7 +2,8 @@
 name = "sfgn-cli"
 version = "0.1.0"
 edition = "2024"
-description = "Unified CLI for compiling, inspecting, slicing, searching, visualizing, and patching SFGN v1.0 graphs"
+rust-version = "1.100"
+description = "Unified SFGN v1.0 workspace compiler, tape inspector, and progressive-reveal LLM agent CLI"
 
 [[bin]]
 name = "sfgn"
@@ -13,3 +14,6 @@ sfgn-core = { path = "../.." }
 sfgn-extract-fs = { path = "../sfgn-extract-fs" }
 sfgn-extract-code = { path = "../sfgn-extract-code" }
 sfgn-extract-docs = { path = "../sfgn-extract-docs" }
+sfgn-llm = { path = "../sfgn-llm" }
+sfgn-context = { path = "../sfgn-context" }
+sfgn-agent = { path = "../sfgn-agent" }

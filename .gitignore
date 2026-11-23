@@ -1,0 +1,18 @@
+# Cargo build artifacts
+/target
+**/*.rs.bk
+*.pdb
+
+# Editor & OS files
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Optional: SFGN generated workspace artifacts (uncomment if you don't want them committed)
+/fs.sfgn
+/sfgn-codes/
+/sfgn-docs/
+/sfgn-memories/
+/sfgn-logs/

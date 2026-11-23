@@ -11,6 +11,9 @@ members = [
   "crates/sfgn-extract-fs",
   "crates/sfgn-extract-code",
   "crates/sfgn-extract-docs",
+  "crates/sfgn-llm",
+  "crates/sfgn-context",
+  "crates/sfgn-agent",
   "crates/sfgn-cli",
 ]
 

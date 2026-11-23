@@ -1,0 +1,11 @@
+[package]
+name = "sfgn-agent"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.100"
+description = "Unified SFGN agent execution loop, primitive/tool dispatcher, and error-to-history retry controller"
+
+[dependencies]
+sfgn-core = { path = "../.." }
+sfgn-llm = { path = "../sfgn-llm" }
+sfgn-context = { path = "../sfgn-context" }
