@@ -83,8 +83,15 @@ impl WorkspaceGraph {
         self.inspect_directory(".")
     }
 
-    /// Universal read-only graph traversal primitive (`inspect_node(address)`).
+    /// Universal read-only graph traversal primitive (`inspect_node(address)`), enriched with
+    /// bidirectional reverse portals (`sfgn-memories/` and `sfgn-docs/` -> code).
     pub fn inspect_node(&self, raw_address: &str) -> Result<GraphNode, InspectError> {
+        let mut node = self.inspect_node_inner(raw_address)?;
+        attach_reverse_portals(&self.root, &mut node);
+        Ok(node)
+    }
+
+    fn inspect_node_inner(&self, raw_address: &str) -> Result<GraphNode, InspectError> {
         let trimmed = raw_address.trim().trim_end_matches(">:");
         if trimmed.is_empty() || trimmed == "." || trimmed == "workspace" {
             return self.inspect_directory(".");
@@ -828,6 +835,29 @@ impl WorkspaceGraph {
                 let rel_posix = rel.to_string_lossy().replace('\\', "/");
                 cb(&rel_posix, &text);
             }
+        }
+    }
+}
+
+fn attach_reverse_portals(workspace_root: &Path, node: &mut GraphNode) {
+    if !matches!(
+        node.level,
+        RevealLevel::Level1Outline | RevealLevel::Level2Leaf
+    ) {
+        return;
+    }
+    if node.address.starts_with(MEMORY_GRAPH_DIR) || node.address.starts_with("tools/") {
+        return;
+    }
+
+    let (rel_file, sym_opt) = match node.address.split_once("::") {
+        Some((file, sym)) => (file, Some(sym)),
+        None => (node.address.as_str(), None),
+    };
+
+    for backlink in crate::portals::resolve_reverse_portals(workspace_root, rel_file, sym_opt) {
+        if !node.relatives.contains(&backlink) {
+            node.relatives.push(backlink);
         }
     }
 }

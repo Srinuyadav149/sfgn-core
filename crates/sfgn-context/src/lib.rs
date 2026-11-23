@@ -5,6 +5,7 @@ pub mod logging;
 pub mod memory;
 pub mod node;
 pub mod persona;
+pub mod portals;
 pub mod scratchpad;
 pub mod tool_schema;
 

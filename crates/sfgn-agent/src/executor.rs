@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fmt::Write;
 use std::process::Command;
 
@@ -36,6 +37,7 @@ pub struct ActionDispatcher {
     pub scratchpad: Scratchpad,
     pub history: TurnHistory,
     verify_command: Vec<String>,
+    recorded_memories: HashSet<String>,
 }
 
 impl ActionDispatcher {
@@ -54,6 +56,7 @@ impl ActionDispatcher {
             scratchpad,
             history,
             verify_command,
+            recorded_memories: HashSet::new(),
         }
     }
 
@@ -140,11 +143,16 @@ impl ActionDispatcher {
             }
         };
 
-        if matches!(
-            step,
-            DispatchStep::Ok { .. } | DispatchStep::Finished { .. }
-        ) {
-            self.scratchpad.set_task_progress(progress_str);
+        match &step {
+            DispatchStep::Ok {
+                progress: Some(p), ..
+            }
+            | DispatchStep::Finished {
+                progress: Some(p), ..
+            } => {
+                self.scratchpad.set_task_progress(p);
+            }
+            _ => {}
         }
 
         step
@@ -628,20 +636,49 @@ impl ActionDispatcher {
         let anchor_symbol = optional_str(payload, "anchor_symbol");
         let action_summary = format!("record_memory(\"{}/{}\")", category, entry_type);
 
+        let dedup_key = format!(
+            "{}:{}:{}:{}",
+            category.trim(),
+            entry_type.trim(),
+            anchor_file.unwrap_or("").trim(),
+            anchor_symbol.unwrap_or("").trim()
+        );
+        if self.recorded_memories.contains(&dedup_key) {
+            let diag = FailureDiagnosis {
+                error_summary: format!("Already recorded memory '{}'", dedup_key),
+                recovery_hint: Some(
+                    "Memory is ALREADY saved. Do NOT call record_memory again; call {\"progress\":\"Done: saved memory note | Next: finish\",\"action\":\"finish\",\"summary\":\"...\"} now."
+                        .to_owned(),
+                ),
+                recovery_banner: "Memory entry was already recorded in an earlier turn. Call `finish` if all sub-tasks are done."
+                    .to_owned(),
+            };
+            self.record_failure(turn, &action_summary, &diag);
+            return DispatchStep::Failed {
+                action_summary,
+                progress,
+                diagnosis: diag,
+            };
+        }
+
         match self
             .memories
             .record(category, entry_type, note, anchor_file, anchor_symbol)
         {
             Ok(entry) => {
+                self.recorded_memories.insert(dedup_key);
                 let obs = format!(
-                    "Recorded memory '{}' in sfgn-memories/{}.sfgn",
+                    "Recorded memory '{}' in sfgn-memories/{}.sfgn — memory step COMPLETE (do NOT repeat; call finish if no sub-tasks remain)",
                     entry.id, entry.category
                 );
                 self.scratchpad.clear_error_banner();
                 self.history.push_ok(turn, &action_summary, &obs);
                 DispatchStep::Ok {
                     action_summary,
-                    progress,
+                    progress: Some(format!(
+                        "Done: recorded {} in sfgn-memories/{}.sfgn | Next: finish",
+                        entry.id, entry.category
+                    )),
                     observation: obs,
                 }
             }
