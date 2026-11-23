@@ -1,4 +1,4 @@
-# sfgn_core
+# sfgn-core
 
 Zero-copy Simple Flat Graph Notation (**SFGN v1.0**) parser, collision-disambiguating builder, dual-topology visualizer, lazy multi-domain workspace graph compiler, and progressive-reveal LLM agent harness in Rust.
 
@@ -6,7 +6,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the internal Pass 1 / Pass 2 pipeline
 
 ## Workspace Crates
 
-- **`sfgn_core` (`src/`)**: Zero-copy Pass 1 linear scanner (`StructuralTape`), Pass 2 topology indexer (`TopologyIndex`), `O(1)` node slicer (`Document`), minimal-collision-qualified graph compiler (`SfgnBuilder`), flat `:`-delimited artifact path codec (`flat_path`), and ASCII / Mermaid visualizer (`viz`).
+- **`sfgn-core` (`src/`)**: Zero-copy Pass 1 linear scanner (`StructuralTape`), Pass 2 topology indexer (`TopologyIndex`), `O(1)` node slicer (`Document`), minimal-collision-qualified graph compiler (`SfgnBuilder`), flat `:`-delimited artifact path codec (`flat_path`), and ASCII / Mermaid visualizer (`viz`).
 - **`sfgn-extract-fs` (`crates/sfgn-extract-fs`)**: `.gitignore`-aware filesystem walker and `gix` Git analyzer emitting eager root `fs.sfgn` graphs with file stats, working-tree status, `last_commit`, historical co-change `>>` edges, and unhydrated lazy portals (`<"sfgn-codes/...">` and `<"sfgn-docs/...">`).
 - **`sfgn-extract-code` (`crates/sfgn-extract-code`)**: `tree-sitter` CST/symbol compiler emitting per-file flat `sfgn-codes/<path>.sfgn` graphs (`"kind": "code_file"`) with zero-parse import-to-portal resolution and bidirectional disk line-span patching (`patch_node_source`). Defaults to `rust`; optional `python` and `typescript` features.
 - **`sfgn-extract-docs` (`crates/sfgn-extract-docs`)**: CommonMark/GFM outline (`H1 > H2 > H3`) and CSV table compiler, binary/vector media header scanner (`PNG`, `JPEG`, `GIF`, `WebP`, `WAV`, `PDF`, `SVG`), and EBNF-to-GBNF grammar transpiler emitting per-file flat `sfgn-docs/<path>.sfgn` graphs (`"kind": "document"` / `"media_proxy"`).
