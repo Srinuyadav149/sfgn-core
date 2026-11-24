@@ -114,6 +114,13 @@ impl WorkspaceGraph {
         }
 
         if trimmed == MEMORY_GRAPH_DIR || trimmed.starts_with("sfgn-memories/") {
+            if let Some(rest) = trimmed.strip_prefix("sfgn-memories/")
+                && let Some((cat, entry_id)) = rest.split_once("::")
+            {
+                return crate::portals::inspect_memory_entry(&self.root, cat, entry_id)
+                    .map_err(|msg| InspectError::new(msg, None));
+            }
+
             let mem = MemoryStore::new(&self.root);
             return mem.inspect(trimmed).map_err(|msg| {
                 InspectError::new(

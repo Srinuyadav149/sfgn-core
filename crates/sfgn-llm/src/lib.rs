@@ -69,7 +69,7 @@ pub struct LlmConfig {
     pub temperature: f32,
     /// Repetition penalty (`1.12` prevents token loops on small local models).
     pub repeat_penalty: f32,
-    /// Maximum completion tokens (`4096` gives LFM3 full `<think>` + JSON headroom inside `-c 8192`).
+    /// Maximum completion tokens (`2048` gives LFM3 full `<think>` + JSON headroom inside `-c 8192`).
     pub max_tokens: u32,
     /// Enable `llama-server` KV-cache prefix reuse (`cache_prompt: true`).
     pub cache_prompt: bool,
@@ -88,7 +88,7 @@ impl Default for LlmConfig {
             model: None,
             temperature: 0.0,
             repeat_penalty: 1.12,
-            max_tokens: 4096,
+            max_tokens: 2048,
             cache_prompt: true,
             use_grammar: true,
             connect_timeout: Duration::from_secs(10),

@@ -2,7 +2,11 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
 
-use sfgn_core::{decode_flat_artifact_path, encode_flat_rel_path};
+use sfgn_core::{
+    Document, NodeView, Scalar, Value, decode_flat_artifact_path, encode_flat_rel_path,
+};
+
+use crate::node::{GraphNode, RevealLevel};
 
 /// Resolves reverse `>>` portals from `sfgn-memories/*.sfgn` and `sfgn-docs/*.sfgn`
 /// pointing back to `rel_file` (and optionally `symbol`).
@@ -20,11 +24,73 @@ pub fn resolve_reverse_portals(
     backlinks.into_iter().collect()
 }
 
+/// Resolves `inspect_node("sfgn-memories/<category>::<entry_id>")` into a Level 2 leaf node.
+pub fn inspect_memory_entry(
+    workspace_root: &Path,
+    category: &str,
+    entry_id: &str,
+) -> Result<GraphNode, String> {
+    let clean_cat = category.trim();
+    let clean_id = entry_id.trim();
+    let shard_path = workspace_root
+        .join("sfgn-memories")
+        .join(format!("{}.sfgn", clean_cat));
+
+    let raw = fs::read_to_string(&shard_path).map_err(|_| {
+        format!(
+            "Memory category '{}' not found in sfgn-memories/",
+            clean_cat
+        )
+    })?;
+    let doc = Document::parse(&raw)
+        .map_err(|e| format!("Invalid memory shard '{}.sfgn': {}", clean_cat, e))?;
+
+    let mut available_ids = Vec::new();
+    for node in doc.nodes() {
+        if node.is_root() {
+            continue;
+        }
+        let id = node_label(node);
+        if id == clean_id {
+            let mut leaf = GraphNode::new(
+                format!("sfgn-memories/{}::{}", clean_cat, id),
+                RevealLevel::Level2Leaf,
+                "memory_entry",
+            );
+            leaf.add_str_prop("category", clean_cat);
+            if let Some(et) = extract_str_prop(node, "entry_type") {
+                leaf.add_str_prop("entry_type", et);
+            }
+            if let Some(af) = extract_str_prop(node, "anchor_file") {
+                leaf.add_str_prop("anchor_file", &af);
+                let target = match extract_str_prop(node, "anchor_symbol") {
+                    Some(sym) if !sym.is_empty() => format!("{}::{}", af, sym),
+                    _ => af,
+                };
+                leaf.relatives.push(target);
+            }
+            if let Some(asym) = extract_str_prop(node, "anchor_symbol") {
+                leaf.add_str_prop("anchor_symbol", asym);
+            }
+            if let Some(note_text) = extract_str_prop(node, "note") {
+                leaf.set_payload(Some("text"), note_text);
+            }
+            return Ok(leaf);
+        }
+        available_ids.push(format!("sfgn-memories/{}::{}", clean_cat, id));
+    }
+
+    Err(format!(
+        "Memory entry '{}' not found in sfgn-memories/{}.sfgn. Available entries: [{}]",
+        clean_id,
+        clean_cat,
+        available_ids.join(", ")
+    ))
+}
+
 #[derive(Debug, Clone)]
 struct ParsedMemoryEntry {
     id: String,
-    entry_type: String,
-    note: String,
     anchor_file: Option<String>,
     anchor_symbol: Option<String>,
 }
@@ -105,46 +171,36 @@ fn collect_doc_backlinks(workspace_root: &Path, norm_file: &str, out: &mut BTree
 }
 
 fn parse_memory_shard_entries(raw: &str) -> Vec<ParsedMemoryEntry> {
+    let Ok(doc) = Document::parse(raw) else {
+        return Vec::new();
+    };
     let mut entries = Vec::new();
-    let mut current: Option<ParsedMemoryEntry> = None;
-
-    for line in raw.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with('"') && trimmed.ends_with("\":") && !trimmed.contains(": ") {
-            if let Some(prev) = current.take() {
-                entries.push(prev);
-            }
-            let id = trimmed.trim_end_matches(':').trim_matches('"').to_owned();
-            current = Some(ParsedMemoryEntry {
-                id,
-                entry_type: "note".to_owned(),
-                note: String::new(),
-                anchor_file: None,
-                anchor_symbol: None,
-            });
+    for node in doc.nodes() {
+        if node.is_root() {
             continue;
         }
-
-        let Some(ref mut entry) = current else {
-            continue;
-        };
-        if let Some((k, v)) = trimmed.split_once(':') {
-            let key = k.trim().trim_matches('"');
-            let val = v.trim().trim_matches('"');
-            match key {
-                "entry_type" => entry.entry_type = val.to_owned(),
-                "note" => entry.note = val.replace("\\\"", "\"").replace("\\n", "\n"),
-                "anchor_file" if val != "null" => entry.anchor_file = Some(val.to_owned()),
-                "anchor_symbol" if val != "null" => entry.anchor_symbol = Some(val.to_owned()),
-                _ => {}
-            }
-        }
-    }
-
-    if let Some(last) = current {
-        entries.push(last);
+        entries.push(ParsedMemoryEntry {
+            id: node_label(node),
+            anchor_file: extract_str_prop(node, "anchor_file"),
+            anchor_symbol: extract_str_prop(node, "anchor_symbol"),
+        });
     }
     entries
+}
+
+fn node_label(node: NodeView<'_, '_>) -> String {
+    node.canonical_path()
+        .and_then(|p| p.segments().last())
+        .map(|s| s.name.clone())
+        .unwrap_or_else(|| node.raw_header_path().trim_matches('"').to_owned())
+}
+
+fn extract_str_prop(node: NodeView<'_, '_>, key: &str) -> Option<String> {
+    let prop = node.property(key)?;
+    match prop.decode().ok()? {
+        Value::Scalar(Scalar::String(cow)) => Some(cow.into_owned()),
+        _ => None,
+    }
 }
 
 fn normalize_rel(p: &str) -> String {
