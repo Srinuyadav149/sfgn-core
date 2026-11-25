@@ -92,10 +92,31 @@ impl RecoveryPlanner {
     }
 
     pub fn duplicate_target(primitive: &str, target: &str) -> FailureDiagnosis {
-        let hint = format!(
-            "\"{}\" is ALREADY loaded in ACTIVE SFGN NODES or REVEALED TOOL NODES—do NOT call {}(\"{}\") again. If you unlocked a tool, call its \"action_name\" directly; otherwise call `finish`.",
-            target, primitive, target
-        );
+        let clean = target.trim();
+        let hint = if primitive == "inspect_tool" {
+            if clean.ends_with('/') {
+                format!(
+                    "\"{}\" is ALREADY loaded in ACTIVE SFGN NODES—do NOT call inspect_tool(\"{}\") again. Call inspect_tool on its child leaf tool listed under '>' (e.g. \"tools/verify/run_verify\").",
+                    clean, clean
+                )
+            } else {
+                let action_hint = clean.rsplit('/').next().unwrap_or(clean);
+                format!(
+                    "\"{}\" is ALREADY unlocked in REVEALED TOOL NODES—do NOT call inspect_tool(\"{}\") again. Call {{\"progress\":\"...\",\"action\":\"{}\", ...}} directly matching its schema.",
+                    clean, clean, action_hint
+                )
+            }
+        } else if !clean.contains("::") && !clean.ends_with('/') {
+            format!(
+                "\"{}\" is ALREADY loaded in ACTIVE SFGN NODES—do NOT call inspect_node(\"{}\") again. Inspect a specific child symbol using \"{}::<symbol>\" from its '>' list, or move to the next step.",
+                clean, clean, clean
+            )
+        } else {
+            format!(
+                "\"{}\" is ALREADY loaded in ACTIVE SFGN NODES—do NOT call {}(\"{}\") again. Proceed with the next step or call `finish`.",
+                clean, primitive, clean
+            )
+        };
         FailureDiagnosis {
             error_summary: format!("Already inspected \"{}\" (already loaded)", target),
             recovery_hint: Some(hint.clone()),
@@ -171,6 +192,8 @@ impl RecoveryPlanner {
             if trimmed.contains(": error")
                 || trimmed.starts_with("error[")
                 || trimmed.starts_with("error:")
+                || trimmed.ends_with("... FAILED")
+                || trimmed.contains("panicked at")
             {
                 diag_lines.push(trimmed.to_owned());
                 if diag_lines.len() >= 5 {

@@ -16,7 +16,7 @@ pub struct Scratchpad {
 
 impl Default for Scratchpad {
     fn default() -> Self {
-        Self::new(3)
+        Self::new(6)
     }
 }
 
@@ -91,6 +91,10 @@ impl Scratchpad {
 
     pub fn has_visited_target(&self, target: &str) -> bool {
         self.visited_targets.contains(target)
+    }
+
+    pub fn is_node_active(&self, target: &str) -> bool {
+        self.active_nodes.iter().any(|n| n.address == target)
     }
 
     /// Records a failed action signature and sets the recovery banner shown on the next turn.

@@ -25,17 +25,19 @@ A) Data Nodes (READ-ONLY via `inspect_node`):
    - Symbol / Section / Memory Leaf: uses `::` copied verbatim from `> [...]` or `>> [...]` (e.g. `"src/flat_path.rs::fn encode_flat_rel_path"`, `"sfgn-memories/notes::notes-1"`).
    - NEVER pass `"tools/..."` to `inspect_node`, and NEVER pass a trailing `"::"` with nothing after it.
 B) Tool Nodes (`tools>:`, UNLOCKED via `inspect_tool`):
-   - `inspect_node` is read-only and CANNOT record memories, edit files, search, or run tests.
+   - `inspect_node` is read-only and CANNOT edit code, create files, record memories, or run tests.
+   - Branch map: `tools/code/` (patch/edit symbols), `tools/fs/` (create/manage files), `tools/docs/` (docs), `tools/memory/` (notes), `tools/verify/` (build & test).
    - To unlock and run a capability under `tools>:`:
-     1. Inspect its branch ending with `/` (e.g. `"tools/memory/"`) via `inspect_tool`.
-     2. Inspect the leaf tool with NO trailing `/` (e.g. `"tools/memory/record_memory"`) via `inspect_tool`.
-     3. Once unlocked in `REVEALED TOOL NODES`, call its `"action_name"` (e.g. `"record_memory"`) as a top-level `"action"` matching its `"schema"` and `"example"`.
+     1. Inspect its branch ending with `/` (e.g. `"tools/code/"` or `"tools/verify/"`) via `inspect_tool`.
+     2. Inspect the leaf tool with NO trailing `/` (e.g. `"tools/code/patch_symbol"`) via `inspect_tool`.
+     3. Once unlocked in `REVEALED TOOL NODES`, call its `"action_name"` as a top-level `"action"` matching its `"schema"` and `"example"`.
 
 === 4. EXECUTION & COMPLETION RULES ===
-1. Execute ONE step per turn; do not simulate tool outputs.
-2. Check `HISTORY`: every `[OK]` step is already completed—never call `inspect_node`, `inspect_tool`, `record_memory`, `patch_symbol`, or `create_file` twice on the same target.
-3. If `=== ACTION REQUIRED ===` appears, follow its `Hint` immediately.
-4. In `"progress"`, write `"Done: <completed> | Next: <step AFTER this JSON action>"` (e.g. when calling `record_memory`, write `"Done: inspected encode_flat_rel_path | Next: finish"`).
-5. As soon as every part of `Goal` is `[OK]`, immediately call `finish`.
-6. Keep reasoning brief and emit ONLY ONE valid JSON object after your reasoning."#
+1. Always explore the relevant workspace nodes (`folder/` -> `file` -> `file::symbol` and any `>>` portals) via `inspect_node` FIRST before opening `tools>:`.
+2. Execute ONE step per turn; do not simulate tool outputs.
+3. Check `HISTORY`: every `[OK]` step is already completed—never call `inspect_node`, `inspect_tool`, `record_memory`, `patch_symbol`, or `create_file` twice on the same target.
+4. If `=== ACTION REQUIRED ===` appears, follow its `Hint` immediately.
+5. In `"progress"`, write `"Done: <completed> | Next: <step AFTER this JSON action>"` (e.g. when calling `record_memory`, write `"Done: inspected encode_flat_rel_path | Next: finish"`).
+6. As soon as every part of `Goal` is `[OK]`, immediately call `finish`.
+7. Keep reasoning brief and emit ONLY ONE valid JSON object after your reasoning."#
 }

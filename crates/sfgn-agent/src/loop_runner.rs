@@ -39,6 +39,14 @@ impl AgentSession {
         let history = TurnHistory::new();
         let logger = SessionLogger::new(&workspace_root, initial_goal);
 
+        let mut coder_cfg = agent_config
+            .coder_llm_config
+            .clone()
+            .unwrap_or_else(|| llm_config.clone());
+        coder_cfg.use_grammar = false;
+        coder_cfg.max_tokens = coder_cfg.max_tokens.max(2048);
+        let coder_client = LlmClient::new(coder_cfg);
+
         let dispatcher = ActionDispatcher::new(
             graph,
             memories,
@@ -46,6 +54,7 @@ impl AgentSession {
             scratchpad,
             history,
             agent_config.verify_command.clone(),
+            coder_client,
         );
 
         Ok(Self {
@@ -112,10 +121,23 @@ impl AgentSession {
 
             on_event(AgentEvent::TurnStats(&response));
 
+            // Rescue JSON if `llama-server` routed a zero-thought response into `reasoning_content`
+            let trimmed_content = response.content.trim();
+            let trimmed_thinking = response.thinking.trim();
+            let effective_content = if trimmed_content.is_empty()
+                && response.finish_reason.as_deref() != Some("length")
+                && trimmed_thinking.starts_with('{')
+                && trimmed_thinking.ends_with('}')
+            {
+                trimmed_thinking
+            } else {
+                trimmed_content
+            };
+
             // Detect `<think>` token budget exhaustion before JSON parsing
-            if response.content.trim().is_empty()
+            if effective_content.is_empty()
                 && (response.finish_reason.as_deref() == Some("length")
-                    || !response.thinking.is_empty())
+                    || !trimmed_thinking.is_empty())
             {
                 consecutive_errors += 1;
                 let diag = RecoveryPlanner::thinking_truncated();
@@ -152,7 +174,13 @@ impl AgentSession {
                 continue;
             }
 
-            match self.dispatcher.dispatch(turn, &response.content) {
+            let dispatch_step = self.dispatcher.dispatch(turn, effective_content);
+            let sub_usage = self.dispatcher.take_sub_usage();
+            self.total_prompt_tokens += sub_usage.prompt_tokens;
+            self.total_completion_tokens += sub_usage.completion_tokens;
+            self.total_cached_tokens += sub_usage.cached_tokens;
+
+            match dispatch_step {
                 DispatchStep::Ok {
                     action_summary,
                     progress,

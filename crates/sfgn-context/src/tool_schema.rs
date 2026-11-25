@@ -130,10 +130,10 @@ impl ToolRegistry {
                 branch: "tools/code/",
                 action_name: "patch_symbol",
                 gbnf_rule_name: "patch-symbol",
-                gbnf_rule_body: r#"patch-symbol ::= "{\"progress\":" json-str ",\"action\":\"patch_symbol\",\"path\":" json-str ",\"symbol\":" json-str ",\"code\":" json-str "}""#,
-                instructions: "Replace a function/struct/method implementation on disk. You MUST inspect the symbol's Level 2 payload first via inspect_node.",
-                schema_template: r#"{"progress":"<done | next>","action":"patch_symbol","path":"<rel_file_path>","symbol":"<symbol_name>","code":"<complete_replacement_code>"}"#,
-                example_json: r#"{"progress":"Done: read fn add | Next: patch fn add","action":"patch_symbol","path":"src/math.rs","symbol":"fn add","code":"pub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}"}"#,
+                gbnf_rule_body: r#"patch-symbol ::= "{\"progress\":" json-str ",\"action\":\"patch_symbol\",\"path\":" json-str ",\"symbol\":" json-str ",\"instruction\":" json-str "}""#,
+                instructions: "Delegate a targeted symbol edit on disk to the code-synthesis sub-agent. You MUST inspect `<path>::<symbol>` via inspect_node first, then pass `<path>` (file only), `<symbol>` copied verbatim from the outline (e.g. \"fn truncate_single_line\"), and a 1-sentence `instruction`.",
+                schema_template: r#"{"progress":"<done | next>","action":"patch_symbol","path":"<rel_file_path>","symbol":"<symbol_from_outline>","instruction":"<one_sentence_edit_instruction>"}"#,
+                example_json: r#"{"progress":"Done: read fn add | Next: patch fn add","action":"patch_symbol","path":"src/math.rs","symbol":"fn add","instruction":"Return a.saturating_add(b) instead of a + b."}"#,
             },
             ToolSpec {
                 address: "tools/docs/search_docs",
@@ -274,7 +274,7 @@ impl ToolRegistry {
             .collect()
     }
 
-    /// Compiles the active GBNF grammar from the 3 core primitives plus currently unlocked tools.
+    /// Compiles the active JSON action GBNF grammar from the 3 core primitives plus unlocked tools.
     pub fn compile_gbnf(&self) -> String {
         let mut ebnf = String::from("Action = \"inspect-node\" | \"inspect-tool\" | \"finish\"");
         for spec in &self.specs {

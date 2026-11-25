@@ -5,7 +5,7 @@ pub mod recovery;
 use std::fmt;
 use std::path::PathBuf;
 
-use sfgn_llm::{LlmError, TurnResponse};
+use sfgn_llm::{LlmConfig, LlmError, TurnResponse};
 
 pub use executor::{ActionDispatcher, DispatchStep};
 pub use loop_runner::{AgentRunner, AgentSession};
@@ -22,6 +22,9 @@ pub struct AgentConfig {
     pub max_active_nodes: usize,
     /// Command executed by `tools/verify/run_verify` (defaults to `cargo check --workspace --message-format=short`).
     pub verify_command: Vec<String>,
+    /// Optional dedicated LLM config for the stateless `patch_symbol` coder sub-agent.
+    /// When `None`, reuses the primary navigator `LlmConfig` (with `use_grammar = false`).
+    pub coder_llm_config: Option<LlmConfig>,
 }
 
 impl Default for AgentConfig {
@@ -29,13 +32,14 @@ impl Default for AgentConfig {
         Self {
             max_turns: 20,
             max_consecutive_errors: 3,
-            max_active_nodes: 4,
+            max_active_nodes: 6,
             verify_command: vec![
                 "cargo".to_owned(),
                 "check".to_owned(),
                 "--workspace".to_owned(),
                 "--message-format=short".to_owned(),
             ],
+            coder_llm_config: None,
         }
     }
 }

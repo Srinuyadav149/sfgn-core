@@ -6,7 +6,7 @@ use sfgn_context::{
     GraphNode, MemoryStore, RevealLevel, Scratchpad, ToolInspectResult, ToolRegistry, TurnHistory,
     WorkspaceGraph,
 };
-use sfgn_llm::{JsonValue, parse_json};
+use sfgn_llm::{ChatMessage, JsonValue, LlmClient, TokenUsage, parse_json};
 
 use crate::recovery::{FailureDiagnosis, RecoveryPlanner};
 
@@ -37,6 +37,8 @@ pub struct ActionDispatcher {
     pub scratchpad: Scratchpad,
     pub history: TurnHistory,
     verify_command: Vec<String>,
+    coder_client: LlmClient,
+    pending_sub_usage: TokenUsage,
     recorded_memories: HashSet<String>,
 }
 
@@ -48,6 +50,7 @@ impl ActionDispatcher {
         scratchpad: Scratchpad,
         history: TurnHistory,
         verify_command: Vec<String>,
+        coder_client: LlmClient,
     ) -> Self {
         Self {
             graph,
@@ -56,8 +59,15 @@ impl ActionDispatcher {
             scratchpad,
             history,
             verify_command,
+            coder_client,
+            pending_sub_usage: TokenUsage::default(),
             recorded_memories: HashSet::new(),
         }
+    }
+
+    /// Drains token usage accumulated by any coder sub-agent calls during the last turn.
+    pub fn take_sub_usage(&mut self) -> TokenUsage {
+        std::mem::take(&mut self.pending_sub_usage)
     }
 
     /// Parses `raw_content` as a single JSON action object, validates `"progress"` + `"action"`,
@@ -183,7 +193,7 @@ impl ActionDispatcher {
         if !norm_check.is_empty()
             && norm_check != "."
             && !norm_check.ends_with('/')
-            && self.scratchpad.has_visited_target(norm_check)
+            && self.scratchpad.is_node_active(norm_check)
         {
             let diag = RecoveryPlanner::duplicate_target("inspect_node", address);
             self.record_failure(turn, &action_summary, &diag);
@@ -482,14 +492,34 @@ impl ActionDispatcher {
         payload: &JsonValue,
         progress: Option<String>,
     ) -> DispatchStep {
-        let Some(path) = required_str(payload, "path") else {
+        let Some(raw_path) = required_str(payload, "path") else {
             return self.fail_missing_param(turn, "patch_symbol", "path", progress);
         };
-        let Some(symbol) = required_str(payload, "symbol") else {
+        let Some(raw_symbol) = required_str(payload, "symbol") else {
             return self.fail_missing_param(turn, "patch_symbol", "symbol", progress);
         };
-        let Some(code) = required_str(payload, "code") else {
-            return self.fail_missing_param(turn, "patch_symbol", "code", progress);
+        let Some(instruction) = required_str(payload, "instruction") else {
+            return self.fail_missing_param(turn, "patch_symbol", "instruction", progress);
+        };
+
+        let (path, symbol) = match raw_path.trim().split_once("::") {
+            Some((file_part, sym_from_path)) => {
+                let sym_clean = raw_symbol.trim();
+                let resolved_sym = if sym_clean.is_empty() || sym_from_path.ends_with(sym_clean) {
+                    sym_from_path.trim()
+                } else {
+                    sym_clean
+                };
+                (file_part.trim(), resolved_sym)
+            }
+            None => {
+                let file_prefix = format!("{}::", raw_path.trim());
+                let sym_clean = raw_symbol
+                    .trim()
+                    .strip_prefix(&file_prefix)
+                    .unwrap_or(raw_symbol.trim());
+                (raw_path.trim(), sym_clean)
+            }
         };
         let action_summary = format!("patch_symbol(\"{}::{}\")", path, symbol);
 
@@ -503,17 +533,44 @@ impl ActionDispatcher {
             };
         }
 
-        match self.graph.patch_symbol(path, symbol, code) {
+        let sym_addr = format!("{}::{}", path, symbol);
+        let target_node = match self.graph.inspect_node(&sym_addr) {
+            Ok(node) => node,
+            Err(err) => {
+                let diag = RecoveryPlanner::inspect_node_failed(&sym_addr, &err);
+                self.record_failure(turn, &action_summary, &diag);
+                return DispatchStep::Failed {
+                    action_summary,
+                    progress,
+                    diagnosis: diag,
+                };
+            }
+        };
+
+        let generated_code =
+            match self.synthesize_symbol_patch(path, symbol, instruction, &target_node) {
+                Ok(code) => code,
+                Err(diag) => {
+                    self.record_failure(turn, &action_summary, &diag);
+                    return DispatchStep::Failed {
+                        action_summary,
+                        progress,
+                        diagnosis: diag,
+                    };
+                }
+            };
+
+        match self.graph.patch_symbol(path, symbol, &generated_code) {
             Ok(obs) => {
-                let sym_addr = format!("{}::{}", path, symbol);
-                if let Ok(updated_node) = self.graph.inspect_node(&sym_addr) {
+                if let Ok(updated_node) = self.graph.inspect_node(&target_node.address) {
                     self.scratchpad.push_node(updated_node);
                 }
-                self.history.push_ok(turn, &action_summary, &obs);
+                let full_obs = format!("{} (via coder sub-agent)", obs);
+                self.history.push_ok(turn, &action_summary, &full_obs);
                 DispatchStep::Ok {
                     action_summary,
                     progress,
-                    observation: obs,
+                    observation: full_obs,
                 }
             }
             Err(err) => {
@@ -526,6 +583,84 @@ impl ActionDispatcher {
                 }
             }
         }
+    }
+
+    fn synthesize_symbol_patch(
+        &mut self,
+        path: &str,
+        symbol: &str,
+        instruction: &str,
+        target_node: &GraphNode,
+    ) -> std::result::Result<String, FailureDiagnosis> {
+        let system_prompt = "\
+You are a focused code-editing sub-agent.\n\
+Given ONE target symbol and a concise edit instruction, output ONLY the complete replacement implementation inside a single fenced code block (e.g. ```rust ... ```).\n\
+Rules:\n\
+- Preserve exact visibility, name, signature, and attributes unless explicitly instructed otherwise.\n\
+- Output the COMPLETE replacement symbol (not a diff).\n\
+- Output ONLY the fenced code block with no surrounding explanation.";
+
+        let mut user_prompt = String::with_capacity(2048);
+        let _ = writeln!(user_prompt, "File: {}", path.trim());
+        let _ = writeln!(user_prompt, "Target Symbol: {}", symbol.trim());
+        let _ = writeln!(user_prompt, "Edit Instruction: {}\n", instruction.trim());
+        user_prompt.push_str("=== TARGET SYMBOL ===\n");
+        user_prompt.push_str(&target_node.render_sfgn());
+
+        let related: Vec<&GraphNode> = self
+            .scratchpad
+            .active_nodes()
+            .filter(|n| n.level == RevealLevel::Level2Leaf && n.address != target_node.address)
+            .collect();
+        if !related.is_empty() {
+            user_prompt.push_str("\n=== RELATED CONTEXT NODES ===\n");
+            for rel_node in related {
+                user_prompt.push_str(&rel_node.render_sfgn());
+            }
+        }
+
+        if let Some(banner) = self.scratchpad.last_error_banner() {
+            user_prompt.push_str("\n=== PREVIOUS ERROR DIAGNOSTIC ===\n");
+            user_prompt.push_str(banner.trim());
+            user_prompt.push('\n');
+        }
+
+        let messages = vec![
+            ChatMessage::system(system_prompt),
+            ChatMessage::user(user_prompt.trim_end()),
+        ];
+
+        let resp = self
+            .coder_client
+            .stream_chat(&messages, None, |_| {})
+            .map_err(|err| FailureDiagnosis {
+                error_summary: format!("Coder sub-agent LLM error: {}", err),
+                recovery_hint: Some(
+                    "Verify the LLM server is reachable and retry `patch_symbol`.".to_owned(),
+                ),
+                recovery_banner: format!("Coder sub-agent transport error: {}", err),
+            })?;
+
+        self.pending_sub_usage.prompt_tokens += resp.usage.prompt_tokens;
+        self.pending_sub_usage.completion_tokens += resp.usage.completion_tokens;
+        self.pending_sub_usage.total_tokens += resp.usage.total_tokens;
+        self.pending_sub_usage.cached_tokens += resp.usage.cached_tokens;
+
+        let extracted = extract_fenced_code(&resp.content);
+        if extracted.trim().is_empty() {
+            return Err(FailureDiagnosis {
+                error_summary: "Coder sub-agent returned empty code block".to_owned(),
+                recovery_hint: Some(
+                    "Retry `patch_symbol` with a simpler, more direct 1-sentence `instruction`."
+                        .to_owned(),
+                ),
+                recovery_banner:
+                    "Coder sub-agent returned an empty response before emitting code. Simplify `instruction` and retry."
+                        .to_owned(),
+            });
+        }
+
+        Ok(extracted)
     }
 
     fn exec_search_docs(
@@ -854,4 +989,24 @@ fn extract_json_object_slice(raw: &str) -> &str {
         }
     }
     trimmed
+}
+
+fn extract_fenced_code(raw: &str) -> String {
+    let without_think = match raw.rfind("</think>") {
+        Some(idx) => &raw[idx + "</think>".len()..],
+        None => raw,
+    };
+    let trimmed = without_think.trim();
+
+    if let Some(open_idx) = trimmed.find("```") {
+        let after_open = &trimmed[open_idx + 3..];
+        let body_start = after_open.find('\n').map(|i| i + 1).unwrap_or(0);
+        let body = &after_open[body_start..];
+        if let Some(close_idx) = body.rfind("```") {
+            return body[..close_idx].trim_end().to_owned();
+        }
+        return body.trim_end().to_owned();
+    }
+
+    trimmed.to_owned()
 }
